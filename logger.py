@@ -7,7 +7,7 @@ What it does
 ------------
 `setup_logger()` returns the pair
 
-    log_fn(metrics: Dict[str, float], step: int | None) -> None
+    log_fn(metrics: Mapping[str, Any], step: int | None) -> None
     close_fn() -> None
 
 where `log_fn` records metrics to the chosen backend *and* echoes a concise
@@ -40,17 +40,22 @@ Design notes
 from __future__ import annotations
 
 import logging
+import atexit
 from datetime import datetime
-from typing import Dict, Optional
+from typing import Any, Mapping 
+from numbers import Number
 
 
-def _fmt(metrics: Dict[str, float]) -> str:
-    """Compact "k=v ..." string for console printing"""
-    return " ".join(f"{k}={v:.4f}" for k, v in metrics.items())
+def _fmt(metrics: Mapping[str, Any]) -> str:
+    """Return stable `k=v` string tolerant to non-numeric values."""
+    return " ".join(
+        f"{k}={v:.4g}" if isinstance(v, Number) else f"{k}={v}"
+        for k, v in metrics.items()
+    )
 
 
 def setup_logger(
-    backend: str = "wandb",
+    backend: str = "console",  # "wandb", "tensorboard", "tb", "console"
     *,
     project: str = "three_layer_pd_marl",
     run_id: str | None = None,
@@ -60,7 +65,7 @@ def setup_logger(
 
     Parameters
     ----------
-    backend : {"wandb", "tensorboard", "console"}
+    backend : {"wandb", "tensorboard", "tb","console"}
         Preferred logging backend.  Falls back to console if unavailable.
     project : str
         WandB / TensorBoard project name.
@@ -75,6 +80,7 @@ def setup_logger(
     # Configure root console logger once (idempotent)
     # ---------------------------------------------------------------------
     logger = logging.getLogger(project)
+    logger.propagate = False 
     if not logger.handlers:
         logger.setLevel(logging.INFO)
         logger.addHandler(logging.StreamHandler())
@@ -90,12 +96,16 @@ def setup_logger(
         else:
             run = wandb.init(project=project, id=run_id, resume="allow", **wandb_kwargs)
 
-            def _log(metrics: Dict[str, float], step: int | None = None):
+            def _log(metrics: Mapping[str, Any], step: int | None = None):
                 wandb.log(metrics, step=step)
-                logger.info(_fmt(metrics))
+                msg = _fmt(metrics)
+                if step is not None:
+                    msg = f"[step {step}] {msg}"
+                logger.info(msg)
 
             def _close():
-                wandb.finish()
+                run.finish()
+            atexit.register(_close)
 
             return _log, _close
 
@@ -111,24 +121,34 @@ def setup_logger(
             log_dir = f"runs/{project}/{run_id or datetime.now().strftime('%Y%m%d-%H%M%S')}"
             writer = SummaryWriter(log_dir)
 
-            def _log(metrics: Dict[str, float], step: int | None = None):
+            def _log(metrics: Mapping[str, Any], step: int | None = None):
                 for k, v in metrics.items():
-                    writer.add_scalar(k, v, step)
-                logger.info(_fmt(metrics))
+                    if isinstance(v, Number):
+                        # Cast to native so TB protobuf doesn't choke on numpy types
+                        writer.add_scalar(k, float(v), step)
+                msg = _fmt(metrics)
+                if step is not None:
+                    msg = f"[step {step}] {msg}"
+                logger.info(msg)
 
             def _close():
                 writer.flush()
                 writer.close()
+            atexit.register(_close)
 
             return _log, _close
 
     # ---------------------------------------------------------------------
     # Fallback – console only
     # ---------------------------------------------------------------------
-    def _log(metrics: Dict[str, float], step: int | None = None):  # noqa: D401
-        logger.info(_fmt(metrics))
+    def _log(metrics: Mapping[str, Any], step: int | None = None):  # noqa: D401
+        msg = _fmt(metrics)
+        if step is not None:
+            msg = f"[step {step}] {msg}"
+        logger.info(msg)
 
     def _close():
         pass
+    atexit.register(_close)
 
     return _log, _close

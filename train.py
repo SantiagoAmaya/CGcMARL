@@ -50,6 +50,8 @@ import os
 import time
 from collections import deque
 from typing import Dict, Iterable
+import glob
+from urllib.parse import quote
 
 # ──────────────────────────────────────────────────────────────
 # Third-party
@@ -66,6 +68,42 @@ from core import Agent, RegionCritic, MaxSumPlanner
 from logger import setup_logger                 # (log_fn, close_fn)
 
 
+def save_full_checkpoint(
+    filepath: str,
+    episode: int,
+    region_critics: Dict[str, RegionCritic],
+    optimizers: Dict[str, torch.optim.SGD],
+    agent_objs: Dict[str, Agent],
+    trace_refs: Dict[str, Dict[str, torch.Tensor]]
+):
+    """Save complete training state for resumption"""
+    checkpoint = {
+        'episode': episode,
+        'region_critics': {
+            R: critic.state_dict() 
+            for R, critic in region_critics.items()
+        },
+        'optimizers': {
+            R: opt.state_dict() 
+            for R, opt in optimizers.items()
+        },
+        'agent_states': {
+            ag: {
+                'lambda_vec': agent.lambda_vec.cpu(),
+                'prev_q': {k: v.cpu() for k, v in agent.prev_q.items()}
+            }
+            for ag, agent in agent_objs.items()
+        },
+        'traces': {
+            R: {name: trace.cpu() for name, trace in traces.items()}
+            for R, traces in trace_refs.items()
+        }
+    }
+    torch.save(checkpoint, filepath)
+    print(f"Saved checkpoint at episode {episode}")
+
+
+
 ###############################################################################
 # Training                                                                    #
 ###############################################################################
@@ -76,6 +114,7 @@ def train(
     *,
     lambda_dim: int = 1,
     maxsum_iters: int = 3,
+    resume_from: str = None,
     alpha: float = 1e-3,
     alpha_rho_ratio: float = 0.1,
     lambda_e: float = 0.95,
@@ -115,7 +154,11 @@ def train(
             pass
 
     # ---------------- logger ----------------
-    log_fn, close_logger = setup_logger(logger, project, run_id=run_id, config={
+    log_fn, close_logger = setup_logger(
+    logger,                    # backend (positional)
+    project=project,           # keyword-only argument
+    run_id=run_id,            # keyword-only argument
+    config={                  # wandb_kwargs
         "env": getattr(env, "spec", "unknown"),
         "num_episodes": num_episodes,
         "lambda_dim": lambda_dim,
@@ -123,7 +166,8 @@ def train(
         "alpha": alpha,
         "alpha_rho_ratio": alpha_rho_ratio,
         "lambda_e": lambda_e
-    })
+    }
+)
 
     # ---------- basic sizes ----------
     reset_out = p_env.reset()
@@ -178,6 +222,33 @@ def train(
     episode_returns, episode_lengths = [], []
     td_errors: deque[float] = deque(maxlen=5_000)
 
+    start_episode = 0
+    if resume_from and os.path.exists(resume_from):
+        checkpoint = torch.load(resume_from, map_location=device)
+        
+        # Restore critics
+        for R, state_dict in checkpoint['region_critics'].items():
+            region_critics[R].load_state_dict(state_dict)
+        
+        # Restore optimizers
+        for R, state_dict in checkpoint['optimizers'].items():
+            optimizers[R].load_state_dict(state_dict)
+        
+        # Restore agent states
+        for ag, state in checkpoint['agent_states'].items():
+            agent_objs[ag].lambda_vec = state['lambda_vec'].to(device)
+            agent_objs[ag].prev_q = {
+                k: v.to(device) for k, v in state['prev_q'].items()
+            }
+        
+        # Restore traces
+        for R, traces in checkpoint['traces'].items():
+            for name, trace in traces.items():
+                trace_refs[R][name] = trace.to(device)
+        
+        start_episode = checkpoint['episode']
+        print(f"Resumed from episode {start_episode}")
+
     # ================== main loop ==================
     for ep in range(num_episodes):
         obs_raw, _ = p_env.reset()
@@ -224,16 +295,34 @@ def train(
 
             # ----- TD updates by owners -----
             for R, players in region_graph.items():
+                # Check if this region was processed in the planning phase
+                if R not in joint_obs_cache:
+                    continue  # Skip regions that weren't cached
+
+                # Dynamic owner: first alive agent in region
+                alive_players = [ag for ag in players if ag in rewards]
+                if not alive_players:
+                    continue  # No alive agents to perform update
+                
+                owner = alive_players[0]  # Temporary owner for this update
+    
+                
+                # Also check if all agents in this region took actions
                 if not all(ag in act_full for ag in players):
                     continue
-                owner = players[0]
+                
                 joint_act = tuple(act_full[ag] for ag in players)
                 r = sum(rewards.get(ag, 0.0) for ag in players) / len(players)
+                
+                # Build next joint observation
                 for pos, ag in enumerate(players):
                     agent_feat_buf[pos, :obs_dim].copy_(next_obs.get(ag, obs_dict[ag]))
                     agent_feat_buf[pos, obs_dim:].copy_(agent_objs[ag].lambda_vec)
-                next_joint_obs = agent_feat_buf[: len(players)].flatten()
-                delta = agent_objs[owner].td_update_region(
+                next_joint_obs = agent_feat_buf[:len(players)].flatten()
+                
+                # Safe TD update with error handling
+                delta = safe_train_step(
+                    agent_objs[owner],
                     R, region_critics[R], joint_obs_cache[R], joint_act, r, next_joint_obs
                 )
                 td_errors.append(float(delta))
@@ -260,12 +349,45 @@ def train(
                     os.remove(old)
 
         log_fn({"episode/return": ep_return, "episode/length": ep_steps}, step=ep + 1)
+        
         if (ep + 1) % 100 == 0:
-            mean100 = float(np.mean(episode_returns[-100:]))
-            print(f"Ep {ep + 1:>5} | R̄₁₀₀ {mean100:8.2f} | len {np.mean(episode_lengths[-100:]):5.1f}")
-            log_fn({"stats/mean_return_100": mean100}, step=ep + 1)
+            metrics = {
+                "stats/mean_return_100": float(np.mean(episode_returns[-100:])),
+                "stats/mean_length_100": float(np.mean(episode_lengths[-100:])),
+            }
+            
+            # Add TD error statistics
+            if td_errors:
+                metrics.update({
+                    "td/error_mean": float(np.mean(td_errors)),
+                    "td/error_std": float(np.std(td_errors)),
+                    "td/error_min": float(np.min(td_errors)),
+                    "td/error_max": float(np.max(td_errors)),
+                })
+            
+            # Add per-region average rewards
+            for R, critic in region_critics.items():
+                metrics[f"avg_reward/{R}"] = float(critic.avg_reward.item())
+            
+            # Add lambda vector statistics
+            lambda_norms = [agent.lambda_vec.norm().item() for agent in agent_objs.values()]
+            metrics["lambda/mean_norm"] = float(np.mean(lambda_norms))
+            
+            log_fn(metrics, step=ep + 1)
 
     close_logger()
+
+def safe_train_step(agent, region, critic, joint_obs, joint_action, reward, next_joint_obs):
+    """Wrapper with error handling for TD updates"""
+    try:
+        delta = agent.td_update_region(
+            region, critic, joint_obs, joint_action, reward, next_joint_obs
+        )
+        return delta
+    except Exception as e:
+        print(f"Warning: TD update failed for region {region}: {e}")
+        # Log error but continue training
+        return 0.0  # Return zero TD error
 
 ###############################################################################
 # Evaluation (completed)                                                      #
@@ -332,7 +454,19 @@ def evaluate_policy(
             if render:
                 p_env.render()
         returns.append(ep_ret)
-    print(f"Evaluation over {episodes} episodes: mean {np.mean(returns):.2f} ± {np.std(returns):.2f}")
+        
+    eval_metrics = {
+        'eval/mean_return': float(np.mean(returns)),
+        'eval/std_return': float(np.std(returns)),
+        'eval/min_return': float(np.min(returns)),
+        'eval/max_return': float(np.max(returns)),
+    }
+    
+    print(f"Evaluation over {episodes} episodes:")
+    print(f"  Mean: {eval_metrics['eval/mean_return']:.2f}")
+    print(f"  Std:  {eval_metrics['eval/std_return']:.2f}")
+    
+    return eval_metrics
 
 ###############################################################################
 # Entry‑point                                                                 #

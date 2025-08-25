@@ -2,7 +2,7 @@
 """
 core.py
 ========
-Core MARL components: networks, critics, planner, and the `Agent` façade.
+Core MARL components: networks, critics, planner, and the `Agent`.
 
 Overview
 --------
@@ -39,7 +39,6 @@ PyTorch ≥1.12 (for nn.Module, optim), NumPy, and optionally CUDA.
 #  Standard libraries
 # ---------------------------------------------------------------
 
-from urllib.parse import quote
 from typing import Dict,  List, Sequence, Tuple
 
 import numpy as np
@@ -51,6 +50,12 @@ import torch
 import torch.nn as nn
 from torch.optim import SGD 
 from utils import flat_index
+
+# -------------------------------------------------------------------
+#  Reproducibility helpers
+# -------------------------------------------------------------------
+torch.manual_seed(0)
+np.random.seed(0)
 
 ###############################################################################
 # MLP                                                                         #
@@ -68,7 +73,16 @@ class MLP(nn.Module):
         self.net = nn.Sequential(*layers)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:  # type: ignore[override]
-        return self.net(x)
+        # Expect a flattened tensor of shape (..., input_dim); give a clear
+        # error early if a caller passes un-flattened observations.
+        if x.dim() == 1:
+            x = x.unsqueeze(0)
+        exp = self.net[0].in_features
+        assert x.shape[-1] == exp, (
+            f"RegionCritic expected last dim {exp}, got {x.shape[-1]}"
+        )
+        out = self.net(x)
+        return out.squeeze(0)
 
 ###############################################################################
 # Region critic (joint)                                                       #
@@ -98,7 +112,7 @@ class RegionCritic(nn.Module):
 ###############################################################################
 
 class MaxSumPlanner:
-    """Max–Sum belief‑propagation planner that now allows **heterogeneous**
+    """Max–Sum belief‑propagation planner that allows **heterogeneous**
     action sizes – each message vector length equals the recipient agent’s
     branch factor `A_i`.  Supply a mapping `action_sizes[agent_id] → A_i`.
     """
@@ -106,13 +120,23 @@ class MaxSumPlanner:
     def __init__(
         self,
         region_graph: Dict[str, List[str]],
-        action_sizes: Dict[str, int],            # ← new
+        action_sizes: Dict[str, int],            #  new
         n_iters: int = 3,
         epsilon: float = 0.05,
         device: torch.device | str = "cpu",
     ):
         self.region_graph = region_graph
         self.sizes = {k: int(v) for k, v in action_sizes.items()}
+        # ------------------------------------------------------------------
+        # Sanity-check: every agent mentioned in the region graph must have
+        # an entry in `action_sizes`, otherwise message buffers cannot be
+        # initialised later on.
+        # ------------------------------------------------------------------
+        unknown = {a for agents in region_graph.values() for a in agents} - self.sizes.keys()
+        if unknown:
+            raise ValueError(
+                f"No action size specified for agents: {sorted(unknown)}"
+            )
         self.n_iters = n_iters
         self.epsilon = epsilon
         self.device = torch.device(device)
@@ -153,31 +177,48 @@ class MaxSumPlanner:
                 if R not in q_tables:
                     continue
                 joint_q = q_tables[R]  # shape [A_i]*k (mixed‑radix)
-                rank = joint_q.dim()
-                for axis, i in enumerate(agents):
-                    inc = [self._broadcast(self.msg_i_to_R[(j, R)], ax_j, rank)
-                           for ax_j, j in enumerate(agents) if j != i]
-                    # Vectorised accumulation: avoids allocating a zero-sized
-                    # buffer every iteration.
-                    if inc:
-                        augmented = joint_q + torch.stack(inc).sum(dim=0)
-                    else:
-                        augmented = joint_q
 
-                    red_dims = tuple(d for d in range(rank) if d != axis)
-                    self.msg_R_to_i[(R, i)] = torch.amax(augmented, dim=red_dims)
+                # ------- factor  →  variable (R → i) messages -------
+                # Sanity-check tensor rank once to catch mis-shaped Q-tables early
+                rank = joint_q.dim()
+                if rank != len(agents):
+                    raise ValueError(
+                        f"q_tables[{R}].dim() = {rank}, expected {len(agents)} "
+                        f"(one axis per agent in region)"
+                    )
+
+                for axis, i in enumerate(agents):
+                        inc = [self._broadcast(self.msg_i_to_R[(j, R)], ax_j, rank)
+                            for ax_j, j in enumerate(agents) if j != i]
+                        # Vectorised accumulation: avoids allocating a zero-sized
+                        # buffer every iteration.
+                        if inc:
+                            augmented = joint_q.clone()
+                            for msg in inc:
+                                augmented += msg
+                        else:
+                            augmented = joint_q
+
+                        red_dims = tuple(d for d in range(rank) if d != axis)
+                        new_msg = torch.amax(augmented, dim=red_dims)
+                        # --- Gauge-fix: subtract max to keep values in a safe range
+                        new_msg -= new_msg.max()
+                        self.msg_R_to_i[(R, i)] = new_msg
             # variable → factor
             for i in {a for agents in self.region_graph.values() for a in agents}:
-                incidents = [R for R in self.region_graph if (R in q_tables and i in self.region_graph[R])]
+                incidents = [
+                    R for R in self.region_graph
+                    if (R in q_tables and i in self.region_graph[R])
+                ]
                 if not incidents:
                     continue
-                base = self._zeros(i)
+                # Pre-compute Σ m_{S→i} once (linear) instead of |N(i)|² additions
+                total_msg = sum(self.msg_R_to_i[(R_dash, i)] for R_dash in incidents)
                 for R in incidents:
-                    agg = base.clone()
-                    for R_dash in incidents:
-                        if R_dash != R:
-                            agg += self.msg_R_to_i[(R_dash, i)]
-                    self.msg_i_to_R[(i, R)] = agg
+                    msg = total_msg - self.msg_R_to_i[(R, i)]
+                    # Optional centring – keeps growth in check
+                    msg -= msg.max()
+                    self.msg_i_to_R[(i, R)] = msg
 
     # ---------------------------------------------------------------
     def select_actions(self) -> Dict[str, int]:
@@ -230,10 +271,17 @@ class Agent:
         sizes = critic.sizes
         idx = flat_index(joint_action, sizes)
         q_vec = critic(joint_obs)
+        if idx >= q_vec.numel():
+            raise IndexError(f"flat_index {idx} out of range for vector of length {q_vec.numel()}")
         q_val = q_vec[idx]
         with torch.no_grad():
             next_q = critic(next_joint_obs).max()
         delta = reward - critic.avg_reward.item() + next_q - q_val
+        # ------------------------------------------------------------------
+        # Bound delta to a reasonable range before it is multiplied into traces.
+        # Prevents inf/NaN in gradients when rewards spike.
+        # ------------------------------------------------------------------
+        delta = float(max(min(delta, 1e3), -1e3))
 
 # ------------------ true-online differential TD(λ) ------------------
         critic.zero_grad()
@@ -247,7 +295,7 @@ class Agent:
                 continue
 
             grad = p.grad
-            e = traces[name]
+            e = traces.setdefault(name, torch.zeros_like(p))
 
             # true-online eligibility trace update
             dot = torch.dot(e.flatten(), grad.flatten())
@@ -256,7 +304,7 @@ class Agent:
             )
 
             # place final gradient for optimiser
-            p.grad = delta * e
+            p.grad = e * delta
 
         # optional clipping
         torch.nn.utils.clip_grad_norm_(critic.parameters(), self.grad_clip)
@@ -267,7 +315,7 @@ class Agent:
 
         # running average reward baseline
         with torch.no_grad():
-            critic.avg_reward += self.alpha_rho * delta
+            critic.avg_reward.add_(self.alpha_rho * delta)
 
         # store last Q for next step (needed by full TO formulation – kept for extension)
         self.prev_q[region] = next_q.detach()
