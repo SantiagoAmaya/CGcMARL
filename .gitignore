@@ -1,0 +1,5 @@
+# Ignore Weights & Biases logs
+wandb/
+
+# Ignore model checkpoints
+checkpoints/

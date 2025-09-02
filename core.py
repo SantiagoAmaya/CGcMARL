@@ -252,6 +252,8 @@ class Agent:
         self, agent_id: str, owned_regions: List[str], traces_refs: Dict[str, Dict[str, torch.Tensor]],
         lambda_dim: int, device: torch.device, alpha: float, alpha_rho: float, lambda_e: float,
         gamma: float, grad_clip: float, optimizers: Dict[str, SGD],
+        eta: float = 1e-4,  # Learning rate for multipliers
+        constraint_thresholds: List[float] = None,
     ):
         self.id = agent_id
         self.owned_regions = owned_regions  # list of region names where this agent is **owner** (first in list)
@@ -263,8 +265,19 @@ class Agent:
         self.lambda_e = lambda_e
         self.gamma = gamma
         self.grad_clip = grad_clip
-        self.optims = optimizers                          # new
+        self.optims = optimizers                         
         self.prev_q: Dict[str, torch.Tensor] = {} 
+
+        # Multiplier parameters
+        self.eta = eta
+        self.constraint_thresholds = constraint_thresholds or []
+        self.num_constraints = len(self.constraint_thresholds)
+        
+        # Initialize multipliers correctly
+        self.lambda_vec = torch.zeros(lambda_dim, device=device)
+        
+        # Track violations for monitoring
+        self.constraint_violations = []
 
     # ----------------------------------------------
     def td_update_region(self, region: str, critic: RegionCritic, joint_obs: torch.Tensor, joint_action: Tuple[int, ...], reward: float, next_joint_obs: torch.Tensor):
@@ -321,3 +334,29 @@ class Agent:
         self.prev_q[region] = next_q.detach()
 
         return float(delta)
+    
+    def update_multipliers(self, reward_components: List[float]) -> None:
+        """Update multipliers based on constraint violations"""
+        for j in range(self.num_constraints):
+            violation = reward_components[j + 1] - self.constraint_thresholds[j]
+            self.lambda_vec[j] = torch.clamp(
+                self.lambda_vec[j] - self.eta * violation,  # This becomes + when violation is negative
+                min=0.0
+            )
+    
+    def gossip_update(self, neighbor_lambdas: Dict[str, torch.Tensor], weights: Dict[str, float]) -> None:
+        """Gossip averaging with neighbors"""
+        new_lambda = weights.get(self.id, 0.5) * self.lambda_vec
+        
+        for neighbor_id, neighbor_lambda in neighbor_lambdas.items():
+            if neighbor_id != self.id:
+                new_lambda += weights.get(neighbor_id, 0.5 / len(neighbor_lambdas)) * neighbor_lambda
+        
+        self.lambda_vec = new_lambda
+    
+    def get_augmented_reward(self, reward_components: List[float]) -> float:
+        """Compute augmented reward for TD updates"""
+        r_augmented = reward_components[0]  # Primary
+        for j in range(self.num_constraints):
+            r_augmented += self.lambda_vec[j].item() * reward_components[j + 1]
+        return r_augmented

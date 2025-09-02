@@ -66,6 +66,8 @@ from torch.optim import SGD
 from utils import to_tensors                    # tensor helpers
 from core import Agent, RegionCritic, MaxSumPlanner
 from logger import setup_logger                 # (log_fn, close_fn)
+from kaz_constraints import KAZRewardDecomposer, CommunicationGraph  # Your new modules
+
 
 
 def save_full_checkpoint(
@@ -111,8 +113,15 @@ def save_full_checkpoint(
 def train(
     env,
     num_episodes: int = 5_000,
+    constraint_thresholds: list[float] = None,
+    eta: float = 1e-4,
+    multiplier_update_freq: str = "step",
+    communication_topology: str = "fully_connected",
     *,
-    lambda_dim: int = 1,
+    min_agent_zombie_dist: float = 0.15,  # Configurable safety distance
+    min_zombie_border_dist: float = 0.2,   # Configurable border distance
+    safety_penalty: float = -0.1,          # Penalty magnitude
+    border_penalty: float = -0.2,          # Penalty magnitude
     maxsum_iters: int = 3,
     resume_from: str = None,
     alpha: float = 1e-3,
@@ -129,7 +138,7 @@ def train(
     run_id: str | None = None,
  ):
     """Run average‑reward TD(λ) on a **parallel** PettingZoo environment."""
-
+    
     # -------------------------------------------------------
     #  Reproducible seeding 
     # -------------------------------------------------------
@@ -152,6 +161,12 @@ def train(
             p_env.seed(seed)
         except Exception:
             pass
+
+    if constraint_thresholds is None:
+        constraint_thresholds = []  # No constraints
+
+    num_constraints = len(constraint_thresholds)
+    lambda_dim = num_constraints 
 
     # ---------------- logger ----------------
     log_fn, close_logger = setup_logger(
@@ -183,6 +198,13 @@ def train(
 
     agents_list = list(obs_dict.keys())
     A_i = {ag: p_env.action_space(ag).n for ag in agents_list}
+    decomposer = KAZRewardDecomposer(
+        min_agent_zombie_dist=min_agent_zombie_dist,
+        min_zombie_border_dist=min_zombie_border_dist,
+        safety_penalty=safety_penalty,
+        border_penalty=border_penalty
+    )
+    comm_graph = CommunicationGraph(agents_list, communication_topology)
 
     # ---------- region graph ----------
     if region_graph is None:
@@ -207,8 +229,11 @@ def train(
     agent_objs: Dict[str, Agent] = {}
     for ag in agents_list:
         owned = [R for R, players in region_graph.items() if players[0] == ag]
-        agent_objs[ag] = Agent(ag, owned, trace_refs, lambda_dim, device, alpha, alpha_rho, lambda_e, gamma=1.0, grad_clip=grad_clip, optimizers=optimizers)
-
+        agent_objs[ag] = Agent(
+            ag, owned, trace_refs, lambda_dim, device, alpha, alpha_rho, lambda_e, 
+            gamma=1.0, grad_clip=grad_clip, optimizers=optimizers,
+            eta=eta, constraint_thresholds=constraint_thresholds  # NEW
+        )
     # ---------- pre-allocated joint-obs buffer ----------
     joint_feat_dim = obs_dim + lambda_dim
     agent_feat_buf = torch.empty(len(agents_list), joint_feat_dim, device=device)
@@ -250,16 +275,21 @@ def train(
         print(f"Resumed from episode {start_episode}")
 
     # ================== main loop ==================
-    for ep in range(num_episodes):
+    for ep in range(start_episode, num_episodes):
         obs_raw, _ = p_env.reset()
         obs_dict = to_tensors(obs_raw, device)
         planner.reset_messages()
+
         # -------- eligibility-trace reset (true-online TD(λ)) --------
         for traces in trace_refs.values():
             for e in traces.values():
                 e.zero_()
         ep_return = 0.0
         ep_steps = 0
+
+        episode_constraint_rewards = {
+            ag: [0.0] * (num_constraints + 1) for ag in agents_list
+        }
 
         while p_env.agents:
             live = p_env.agents
@@ -286,7 +316,34 @@ def train(
             act_full = planner.select_actions()
             act_live = {ag: act_full[ag] for ag in live}
 
+            # Environment step
             next_obs_raw, rewards, terms, truncs, _ = p_env.step(act_live)
+
+            # Decompose rewards
+            next_obs_raw, rewards, terms, truncs, _ = p_env.step(act_live)
+            next_obs = to_tensors(next_obs_raw, device)
+            reward_components = decomposer.decompose_rewards(next_obs, rewards)
+
+            # Accumulate constraint rewards
+            for ag, components in reward_components.items():
+                for i, r in enumerate(components):
+                    episode_constraint_rewards[ag][i] += r
+
+            # Update multipliers (if per-step)
+            if multiplier_update_freq == "step":
+                for ag in live:
+                    agent_objs[ag].update_multipliers(reward_components[ag])
+                
+                # Gossip
+                for ag in live:
+                    neighbors = comm_graph.get_neighbors(ag)
+                    neighbor_lambdas = {
+                        n: agent_objs[n].lambda_vec 
+                        for n in neighbors if n in agent_objs
+                    }
+                    weights = comm_graph.get_weights(ag)
+                    agent_objs[ag].gossip_update(neighbor_lambdas, weights)
+            
 
             # ----- bookkeeping -----
             ep_return += sum(rewards.values()) / max(len(rewards), 1)
@@ -306,13 +363,24 @@ def train(
                 
                 owner = alive_players[0]  # Temporary owner for this update
     
-                
                 # Also check if all agents in this region took actions
                 if not all(ag in act_full for ag in players):
                     continue
+
+                # Compute augmented reward for region
+                r_components = [0.0] * (num_constraints + 1)
+                for i in range(num_constraints + 1):
+                    # Average the reward components across agents in region
+                    r_components[i] = sum(
+                        reward_components.get(ag, [0.0] * (num_constraints + 1))[i] 
+                        for ag in players
+                    ) / len(players)
+                
+                # Get augmented reward using owner's multipliers
+                r_augmented = agent_objs[owner].get_augmented_reward(r_components)
+    
                 
                 joint_act = tuple(act_full[ag] for ag in players)
-                r = sum(rewards.get(ag, 0.0) for ag in players) / len(players)
                 
                 # Build next joint observation
                 for pos, ag in enumerate(players):
@@ -323,11 +391,37 @@ def train(
                 # Safe TD update with error handling
                 delta = safe_train_step(
                     agent_objs[owner],
-                    R, region_critics[R], joint_obs_cache[R], joint_act, r, next_joint_obs
+                    R, region_critics[R], joint_obs_cache[R], joint_act, 
+                    r_augmented,  # Use augmented instead of raw reward
+                    next_joint_obs
                 )
+                
                 td_errors.append(float(delta))
 
             obs_dict = next_obs
+
+        # Update multipliers (if per-episode)
+        if multiplier_update_freq == "episode":
+            for ag in agents_list:
+                agent_objs[ag].update_multipliers(episode_constraint_rewards[ag])
+
+            
+            # Gossip
+            for ag in agents_list:
+                neighbors = comm_graph.get_neighbors(ag)
+                neighbor_lambdas = {
+                    n: agent_objs[n].lambda_vec 
+                    for n in neighbors
+                }
+                weights = comm_graph.get_weights(ag)
+                agent_objs[ag].gossip_update(neighbor_lambdas, weights)
+        
+        # Log constraint metrics
+        constraints_satisfied = all(
+            episode_constraint_rewards[ag][j+1] >= constraint_thresholds[j]
+            for ag in agents_list
+            for j in range(num_constraints)
+        )
 
         # ----- end of episode -----
         episode_returns.append(ep_return)
@@ -350,10 +444,17 @@ def train(
 
         log_fn({"episode/return": ep_return, "episode/length": ep_steps}, step=ep + 1)
         
-        if (ep + 1) % 100 == 0:
+        if (ep + 1) % 50 == 0:
             metrics = {
                 "stats/mean_return_100": float(np.mean(episode_returns[-100:])),
                 "stats/mean_length_100": float(np.mean(episode_lengths[-100:])),
+                "constraints/satisfied": float(constraints_satisfied),
+                "constraints/avg_safety_violations": np.mean([
+                    episode_constraint_rewards[ag][1] for ag in agents_list
+                ]),
+                "constraints/avg_border_violations": np.mean([
+                    episode_constraint_rewards[ag][2] for ag in agents_list
+                ]),
             }
             
             # Add TD error statistics
@@ -372,6 +473,22 @@ def train(
             # Add lambda vector statistics
             lambda_norms = [agent.lambda_vec.norm().item() for agent in agent_objs.values()]
             metrics["lambda/mean_norm"] = float(np.mean(lambda_norms))
+
+            # Log multiplier evolution
+            for i, ag in enumerate(agents_list[:min(2, len(agents_list))]):
+                lambda_vals = agent_objs[ag].lambda_vec
+                for j in range(min(num_constraints, len(lambda_vals))):
+                    metrics[f"lambda/agent{i}_constraint{j}"] = lambda_vals[j].item()
+            
+            # Log constraint violation rates
+            total_steps = ep_steps * len(agents_list)
+            if total_steps > 0:
+                metrics["constraints/safety_violation_rate"] = abs(
+                    sum(episode_constraint_rewards[ag][1] for ag in agents_list) / total_steps
+                )
+                metrics["constraints/border_violation_rate"] = abs(
+                    sum(episode_constraint_rewards[ag][2] for ag in agents_list) / total_steps
+                )
             
             log_fn(metrics, step=ep + 1)
 
@@ -480,19 +597,31 @@ if __name__ == "__main__":
 
     # Knights–Archers–Zombies is parallel by default and uses a Discrete(9) action space.
     env = kaz.parallel_env(
-        render_mode="human",
+        render_mode=None,
         vector_state=True,
-        use_typemasks=True,
+        use_typemasks=True,  # Important for identifying zombies
     )
+
+    if torch.cuda.is_available():
+        torch.backends.cudnn.benchmark = True  
+        torch.backends.cuda.matmul.allow_tf32 = True  
+        print(f"✅ CUDA optimizations enabled for {torch.cuda.get_device_name()}")
+
 
     train(
         env,
         num_episodes=10_000,
+        # Constraint parameters
+        constraint_thresholds=[0, 0],  # Per-episode limits
+        eta=2e-4,
+        alpha=2e-3,
+        multiplier_update_freq="step",
+        communication_topology="fully_connected",
         device="cuda" if torch.cuda.is_available() else "cpu",
         logger="wandb",
         project="three_layer_pd_marl",
         seed=0,
-        grad_clip=10.0,
+        grad_clip=5.0,
         run_id=RUN_ID,
     )
 
