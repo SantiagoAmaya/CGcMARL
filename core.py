@@ -50,6 +50,7 @@ import torch
 import torch.nn as nn
 from torch.optim import SGD 
 from utils import flat_index
+from collections import deque
 
 # -------------------------------------------------------------------
 #  Reproducibility helpers
@@ -62,6 +63,7 @@ np.random.seed(0)
 ###############################################################################
 
 class MLP(nn.Module):
+    @torch.jit.export
     def __init__(self, in_dim: int, out_dim: int, hidden: Sequence[int] = (128, 128)):
         super().__init__()
         layers: List[nn.Module] = []
@@ -72,6 +74,7 @@ class MLP(nn.Module):
         layers.append(nn.Linear(last, out_dim))
         self.net = nn.Sequential(*layers)
 
+    @torch.jit.export
     def forward(self, x: torch.Tensor) -> torch.Tensor:  # type: ignore[override]
         # Expect a flattened tensor of shape (..., input_dim); give a clear
         # error early if a caller passes un-flattened observations.
@@ -99,9 +102,20 @@ class RegionCritic(nn.Module):
         input_dim = len(self.sizes) * (obs_dim_per_agent + lambda_dim)
         output_dim = int(np.prod(self.sizes))
         self.q_net = MLP(input_dim, output_dim)
+               
+        # Better initialization for stability
+        for m in self.q_net.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight, gain=0.01)
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, -1.0)  # Pessimistic initialization
+       
         # Baseline must persist in checkpoints **but** stay out of
-        # .parameters().  Register it as a buffer instead.
+        # Initialize with small value and add bounds
         self.register_buffer("avg_reward", torch.zeros(1))
+        self.register_buffer("avg_reward_min", torch.tensor(-1.0))
+        self.register_buffer("avg_reward_max", torch.tensor(1.0))
+
 
     def forward(self, obs_concat: torch.Tensor) -> torch.Tensor:
         return self.q_net(obs_concat)
@@ -141,6 +155,10 @@ class MaxSumPlanner:
         self.epsilon = epsilon
         self.device = torch.device(device)
 
+        # Adaptive clamping parameters
+        self.clamp_threshold = 50.0  # Start conservative
+        self.clamp_adaptation_rate = 0.01
+
         # message buffers   R→i  and  i→R
         self.msg_R_to_i: Dict[Tuple[str, str], torch.Tensor] = {}
         self.msg_i_to_R: Dict[Tuple[str, str], torch.Tensor] = {}
@@ -160,8 +178,15 @@ class MaxSumPlanner:
                 self.msg_i_to_R[(i, R)] = self._zeros(i)
 
     def reset_messages(self):
-        for buf in (*self.msg_R_to_i.values(), *self.msg_i_to_R.values()):
-            buf.zero_()
+        with torch.no_grad():
+           for key in self.msg_R_to_i:
+               self.msg_R_to_i[key].zero_()
+               self.msg_R_to_i[key] = self.msg_R_to_i[key].detach()
+           for key in self.msg_i_to_R:
+               self.msg_i_to_R[key].zero_()
+               self.msg_i_to_R[key] = self.msg_i_to_R[key].detach()
+
+
 
     @staticmethod
     def _broadcast(vec: torch.Tensor, axis: int, rank: int) -> torch.Tensor:
@@ -171,54 +196,75 @@ class MaxSumPlanner:
 
     # ---------------------------------------------------------------
     def step(self, q_tables: Dict[str, torch.Tensor]):
-        for _ in range(self.n_iters):
-            # factor → variable
-            for R, agents in self.region_graph.items():
-                if R not in q_tables:
-                    continue
-                joint_q = q_tables[R]  # shape [A_i]*k (mixed‑radix)
+        with torch.no_grad():
+            for _ in range(self.n_iters):
+                # factor → variable
+                for R, agents in self.region_graph.items():
+                    if R not in q_tables:
+                        continue
+                    joint_q = q_tables[R]  # shape [A_i]*k (mixed‑radix)
 
-                # ------- factor  →  variable (R → i) messages -------
-                # Sanity-check tensor rank once to catch mis-shaped Q-tables early
-                rank = joint_q.dim()
-                if rank != len(agents):
-                    raise ValueError(
-                        f"q_tables[{R}].dim() = {rank}, expected {len(agents)} "
-                        f"(one axis per agent in region)"
-                    )
+                    # ------- factor  →  variable (R → i) messages -------
+                    # Sanity-check tensor rank once to catch mis-shaped Q-tables early
+                    rank = joint_q.dim()
+                    if rank != len(agents):
+                        raise ValueError(
+                            f"q_tables[{R}].dim() = {rank}, expected {len(agents)} "
+                            f"(one axis per agent in region)"
+                        )
 
-                for axis, i in enumerate(agents):
-                        inc = [self._broadcast(self.msg_i_to_R[(j, R)], ax_j, rank)
-                            for ax_j, j in enumerate(agents) if j != i]
-                        # Vectorised accumulation: avoids allocating a zero-sized
-                        # buffer every iteration.
-                        if inc:
-                            augmented = joint_q.clone()
-                            for msg in inc:
-                                augmented += msg
-                        else:
-                            augmented = joint_q
+                    for axis, i in enumerate(agents):
+                            inc = [self._broadcast(self.msg_i_to_R[(j, R)], ax_j, rank)
+                                for ax_j, j in enumerate(agents) if j != i]
+                            # Vectorised accumulation: avoids allocating a zero-sized
+                            # buffer every iteration.
+                            if inc:
+                                augmented = joint_q.clone()
+                                for msg in inc:
+                                    augmented += msg
+                            else:
+                                augmented = joint_q
 
-                        red_dims = tuple(d for d in range(rank) if d != axis)
-                        new_msg = torch.amax(augmented, dim=red_dims)
-                        # --- Gauge-fix: subtract max to keep values in a safe range
-                        new_msg -= new_msg.max()
-                        self.msg_R_to_i[(R, i)] = new_msg
-            # variable → factor
-            for i in {a for agents in self.region_graph.values() for a in agents}:
-                incidents = [
-                    R for R in self.region_graph
-                    if (R in q_tables and i in self.region_graph[R])
-                ]
-                if not incidents:
-                    continue
-                # Pre-compute Σ m_{S→i} once (linear) instead of |N(i)|² additions
-                total_msg = sum(self.msg_R_to_i[(R_dash, i)] for R_dash in incidents)
-                for R in incidents:
-                    msg = total_msg - self.msg_R_to_i[(R, i)]
-                    # Optional centring – keeps growth in check
-                    msg -= msg.max()
-                    self.msg_i_to_R[(i, R)] = msg
+                            red_dims = tuple(d for d in range(rank) if d != axis)
+                            new_msg = torch.amax(augmented, dim=red_dims)
+
+                            # --- Improved gauge-fix with numerical stability
+                            msg_max = new_msg.max()
+                            msg_min = new_msg.min()
+                            msg_range = msg_max - msg_min
+                            
+                            # Adapt clamping threshold based on observed ranges
+                            if msg_range > self.clamp_threshold * 2:
+                                # Range is too large, increase threshold slowly
+                                self.clamp_threshold = min(
+                                    self.clamp_threshold * (1 + self.clamp_adaptation_rate),
+                                    200.0  # Max threshold
+                                )
+                                new_msg = torch.clamp(
+                                    new_msg - msg_max, 
+                                    min=-self.clamp_threshold, 
+                                    max=self.clamp_threshold
+                                )
+                            else:
+                                new_msg -= msg_max
+
+                            self.msg_R_to_i[(R, i)] = new_msg.detach()
+
+                # variable → factor
+                for i in {a for agents in self.region_graph.values() for a in agents}:
+                    incidents = [
+                        R for R in self.region_graph
+                        if (R in q_tables and i in self.region_graph[R])
+                    ]
+                    if not incidents:
+                        continue
+                    # Pre-compute Σ m_{S→i} once (linear) instead of |N(i)|² additions
+                    total_msg = sum(self.msg_R_to_i[(R_dash, i)] for R_dash in incidents)
+                    for R in incidents:
+                        msg = total_msg - self.msg_R_to_i[(R, i)]
+                        # Optional centring – keeps growth in check
+                        msg -= msg.max()
+                        self.msg_i_to_R[(i, R)] = msg
 
     # ---------------------------------------------------------------
     def select_actions(self) -> Dict[str, int]:
@@ -254,6 +300,7 @@ class Agent:
         gamma: float, grad_clip: float, optimizers: Dict[str, SGD],
         eta: float = 1e-4,  # Learning rate for multipliers
         constraint_thresholds: List[float] = None,
+        constraint_is_local: List[bool] = None
     ):
         self.id = agent_id
         self.owned_regions = owned_regions  # list of region names where this agent is **owner** (first in list)
@@ -266,18 +313,27 @@ class Agent:
         self.gamma = gamma
         self.grad_clip = grad_clip
         self.optims = optimizers                         
-        self.prev_q: Dict[str, torch.Tensor] = {} 
+        self.prev_q: Dict[str, torch.Tensor] = {}
 
         # Multiplier parameters
         self.eta = eta
         self.constraint_thresholds = constraint_thresholds or []
-        self.num_constraints = len(self.constraint_thresholds)
+        self.num_constraints = len(self.constraint_thresholds) 
+        self.constraint_is_local = constraint_is_local or [False] * self.num_constraints
         
-        # Initialize multipliers correctly
+        # Initialize multipliers
         self.lambda_vec = torch.zeros(lambda_dim, device=device)
+        if lambda_dim != self.num_constraints:
+            raise ValueError(f"lambda_dim ({lambda_dim}) must match num_constraints ({self.num_constraints})")
+
         
         # Track violations for monitoring
-        self.constraint_violations = []
+        self.constraint_violations = deque(maxlen=100)
+
+        # Initialize traces properly for owned regions
+        for region in self.owned_regions:
+            if region not in self.traces_refs:
+                self.traces_refs[region] = {}
 
     # ----------------------------------------------
     def td_update_region(self, region: str, critic: RegionCritic, joint_obs: torch.Tensor, joint_action: Tuple[int, ...], reward: float, next_joint_obs: torch.Tensor):
@@ -286,19 +342,42 @@ class Agent:
         q_vec = critic(joint_obs)
         if idx >= q_vec.numel():
             raise IndexError(f"flat_index {idx} out of range for vector of length {q_vec.numel()}")
-        q_val = q_vec[idx]
+        q_val = q_vec[idx]  # This is still a tensor with gradients
+
         with torch.no_grad():
+            q_val_float = q_val.item()  # Get float value for delta computation
             next_q = critic(next_joint_obs).max()
-        delta = reward - critic.avg_reward.item() + next_q - q_val
+            # Check for NaN
+            if torch.isnan(next_q):
+                print(f"WARNING: NaN detected in Q-values for region {region}")
+                # Try to recover by using mean instead of max
+                next_q_vec = critic(next_joint_obs)
+                valid_q = next_q_vec[~torch.isnan(next_q_vec)]
+                if len(valid_q) > 0:
+                    next_q = valid_q.mean()
+                else:
+                    next_q = torch.tensor(0.0, device=self.device)
+                    print(f"ERROR: All Q-values are NaN for region {region}")
+            next_q_float = next_q.item()  # Convert to float
+         
+        # Compute delta as a float value
+        delta = reward - critic.avg_reward.item() + next_q_float - q_val_float
+
+        # Prevent NaN/Inf propagation
+        if not np.isfinite(delta):
+            print(f"WARNING: Non-finite TD error {delta} in region {region}")
+            delta = 0.0
         # ------------------------------------------------------------------
         # Bound delta to a reasonable range before it is multiplied into traces.
         # Prevents inf/NaN in gradients when rewards spike.
         # ------------------------------------------------------------------
-        delta = float(max(min(delta, 1e3), -1e3))
+        delta = float(max(min(delta, 10.0), -10.0))
 
-# ------------------ true-online differential TD(λ) ------------------
+        # ------------------ true-online differential TD(λ) ------------------
         critic.zero_grad()
-        q_val.backward(retain_graph=False)
+        # need q_val as a tensor for backward pass
+        q_val = q_vec[idx]  # Re-get it as tensor for gradient computation
+        q_val.backward(retain_graph=False, create_graph=False)
 
         traces = self.traces_refs[region]
         opt = self.optims[region]
@@ -307,20 +386,29 @@ class Agent:
             if p.grad is None:
                 continue
 
-            grad = p.grad
-            e = traces.setdefault(name, torch.zeros_like(p))
+            grad = p.grad.detach()
+            if name not in traces:
+                traces[name] = torch.zeros_like(p, device=self.device)
+            e = traces[name]
 
-            # true-online eligibility trace update
-            dot = torch.dot(e.flatten(), grad.flatten())
-            e.mul_(self.gamma * self.lambda_e).add_(
-                grad * (1.0 - self.alpha * self.gamma * self.lambda_e * dot)
-            )
+            # Online eligibility trace update
+            with torch.no_grad():  # Ensure no graph creation
+               dot = torch.dot(e.flatten(), grad.flatten()).item()
+               e.mul_(self.gamma * self.lambda_e).add_(
+                   grad * (1.0 - self.alpha * self.gamma * self.lambda_e * dot)
+               )
+               # Detach and reassign
+               e = e.detach_()
+               traces[name] = e
 
             # place final gradient for optimiser
-            p.grad = e * delta
+            with torch.no_grad():
+               p.grad = (e * delta).detach_()
 
-        # optional clipping
+        # Dual clipping for stability
         torch.nn.utils.clip_grad_norm_(critic.parameters(), self.grad_clip)
+        torch.nn.utils.clip_grad_value_(critic.parameters(), clip_value=1.0) 
+        
 
         # optimiser step
         opt.step()
@@ -328,30 +416,60 @@ class Agent:
 
         # running average reward baseline
         with torch.no_grad():
-            critic.avg_reward.add_(self.alpha_rho * delta)
+            if not np.isfinite(self.alpha_rho * delta):
+                print(f"WARNING: Non-finite average reward update in region {region}")
+            else:
+                # Use exponential moving average with decay
+                decay = 0.999  # Stronger smoothing
+                new_avg = decay * critic.avg_reward + (1 - decay) * reward
+                # Clamp to reasonable game-specific bounds
+                critic.avg_reward.copy_(torch.clamp(new_avg, -0.1, 0.1))
 
-        # store last Q for next step (needed by full TO formulation – kept for extension)
-        self.prev_q[region] = next_q.detach()
+
+
+        # store last Q for next step (needed by full TO formulation)
+        with torch.no_grad():
+           self.prev_q[region] = next_q_float  # Store as float, not tensor
+
 
         return float(delta)
     
     def update_multipliers(self, reward_components: List[float]) -> None:
         """Update multipliers based on constraint violations"""
+        # Safety check for reward components
+        expected_components = self.num_constraints + 1
+        if len(reward_components) < expected_components:
+            print(f"Warning: Expected {expected_components} reward components, got {len(reward_components)}")
+            # Pad with zeros if needed
+            reward_components = reward_components + [0.0] * (expected_components - len(reward_components))
+        
         for j in range(self.num_constraints):
-            violation = reward_components[j + 1] - self.constraint_thresholds[j]
+            # Violation is positive when constraint is violated (r_j < c_j)
+            violation = self.constraint_thresholds[j] - reward_components[j + 1]
             self.lambda_vec[j] = torch.clamp(
-                self.lambda_vec[j] - self.eta * violation,  # This becomes + when violation is negative
-                min=0.0
-            )
+                 self.lambda_vec[j] + self.eta * violation,
+                 min=0.0,
+                 max=20.0
+             )
     
-    def gossip_update(self, neighbor_lambdas: Dict[str, torch.Tensor], weights: Dict[str, float]) -> None:
-        """Gossip averaging with neighbors"""
-        new_lambda = weights.get(self.id, 0.5) * self.lambda_vec
+    def gossip_update(self, neighbor_lambdas: Dict[str, torch.Tensor], weights: Dict[str, float]):
+        """Gossip consensus update following Eq. 15 from the paper"""
+        new_lambda = self.lambda_vec.clone()
         
-        for neighbor_id, neighbor_lambda in neighbor_lambdas.items():
-            if neighbor_id != self.id:
-                new_lambda += weights.get(neighbor_id, 0.5 / len(neighbor_lambdas)) * neighbor_lambda
-        
+        for j in range(self.num_constraints):
+            if not self.constraint_is_local[j]:  # Only gossip global constraints
+                # Metropolis weights should sum to 1
+                self_weight = weights.get(self.id, 1.0 - sum(
+                    w for k, w in weights.items() if k != self.id
+                ))
+                weighted_sum = self_weight * self.lambda_vec[j]
+    
+                for neighbor_id, neighbor_lambda in neighbor_lambdas.items():
+                    if neighbor_id != self.id:
+                        weighted_sum += weights.get(neighbor_id, 0.25) * neighbor_lambda[j]
+                new_lambda[j] = weighted_sum
+            # Local constraints -> no gossip
+            
         self.lambda_vec = new_lambda
     
     def get_augmented_reward(self, reward_components: List[float]) -> float:

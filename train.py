@@ -49,9 +49,11 @@ import random
 import os
 import time
 from collections import deque
-from typing import Dict, Iterable
+import random
+from typing import Dict, Iterable, Any
 import glob
 from urllib.parse import quote
+import traceback
 
 # ──────────────────────────────────────────────────────────────
 # Third-party
@@ -69,14 +71,15 @@ from logger import setup_logger                 # (log_fn, close_fn)
 from kaz_constraints import KAZRewardDecomposer, CommunicationGraph  # Your new modules
 
 
-
 def save_full_checkpoint(
     filepath: str,
     episode: int,
     region_critics: Dict[str, RegionCritic],
     optimizers: Dict[str, torch.optim.SGD],
+    schedulers: Dict[str, Any],
     agent_objs: Dict[str, Agent],
-    trace_refs: Dict[str, Dict[str, torch.Tensor]]
+    trace_refs: Dict[str, Dict[str, torch.Tensor]],
+    planner: MaxSumPlanner
 ):
     """Save complete training state for resumption"""
     checkpoint = {
@@ -89,21 +92,30 @@ def save_full_checkpoint(
             R: opt.state_dict() 
             for R, opt in optimizers.items()
         },
+        'schedulers': {
+            R: sched.state_dict()
+            for R, sched in schedulers.items()
+        },
         'agent_states': {
             ag: {
                 'lambda_vec': agent.lambda_vec.cpu(),
-                'prev_q': {k: v.cpu() for k, v in agent.prev_q.items()}
+                'prev_q': {
+                    k: torch.tensor(v) if not torch.is_tensor(v) else v.cpu() 
+                    for k, v in agent.prev_q.items()
+                },
+                'constraint_violations': list(agent.constraint_violations),  # Convert deque to list
+                'eta': agent.eta  # Save current learning rate
             }
             for ag, agent in agent_objs.items()
         },
         'traces': {
             R: {name: trace.cpu() for name, trace in traces.items()}
             for R, traces in trace_refs.items()
-        }
+        },
+        'planner_epsilon': planner.epsilon
     }
     torch.save(checkpoint, filepath)
-    print(f"Saved checkpoint at episode {episode}")
-
+    print(f"Saved full checkpoint at episode {episode} to {filepath}")
 
 
 ###############################################################################
@@ -114,7 +126,8 @@ def train(
     env,
     num_episodes: int = 5_000,
     constraint_thresholds: list[float] = None,
-    eta: float = 1e-4,
+    eta: float = None, 
+    eta_decay: float = 0.999,
     multiplier_update_freq: str = "step",
     communication_topology: str = "fully_connected",
     *,
@@ -136,6 +149,9 @@ def train(
     checkpoint_interval: int = 500,
     keep_last_ckpts: int = 5,
     run_id: str | None = None,
+    memory_limit_mb: float = None,  # Add configurable memory limit
+    enable_aggressive_gc: bool = False,  # Make GC optional
+    gc_frequency: int = 100,  # Configurable GC frequency
  ):
     """Run average‑reward TD(λ) on a **parallel** PettingZoo environment."""
     
@@ -163,10 +179,17 @@ def train(
             pass
 
     if constraint_thresholds is None:
-        constraint_thresholds = []  # No constraints
+        constraint_thresholds = [0.5, 0.5]  # No constraints
 
+    # Ensure two-timescale separation: η_t = o(α_t)
+    if eta is None:
+        eta = alpha * 0.01  # Multiplier learning should be slower
+    # Track effective eta for decay
+    current_eta = eta
+  
     num_constraints = len(constraint_thresholds)
     lambda_dim = num_constraints 
+    constraint_is_local = [True, False]
 
     # ---------------- logger ----------------
     log_fn, close_logger = setup_logger(
@@ -199,13 +222,19 @@ def train(
     agents_list = list(obs_dict.keys())
     A_i = {ag: p_env.action_space(ag).n for ag in agents_list}
     decomposer = KAZRewardDecomposer(
-        min_agent_zombie_dist=min_agent_zombie_dist,
-        min_zombie_border_dist=min_zombie_border_dist,
-        safety_penalty=safety_penalty,
-        border_penalty=border_penalty
+        danger_distance=0.02,       # Only death is penalized
+        border_danger_rel_y=0.1   # Bottom 10% is critical
     )
     comm_graph = CommunicationGraph(agents_list, communication_topology)
 
+    # Validate communication graph connectivity
+    for ag in agents_list:
+        neighbors = comm_graph.get_neighbors(ag)
+        weights = comm_graph.get_weights(ag)
+        weight_sum = sum(weights.values())
+        if abs(weight_sum - 1.0) > 1e-6:
+            raise ValueError(f"Gossip weights for agent {ag} don't sum to 1: {weight_sum}")
+    
     # ---------- region graph ----------
     if region_graph is None:
         region_graph = {"global": agents_list}
@@ -224,6 +253,10 @@ def train(
                         for name, p in crit.named_parameters() if p.requires_grad}
         optimizers[R] = SGD(crit.parameters(), lr=alpha)
 
+    schedulers = {
+        R: torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=num_episodes+10, eta_min=alpha*0.01)
+        for R, opt in optimizers.items()
+    }
     # ---------- agents ----------
     alpha_rho = alpha * alpha_rho_ratio
     agent_objs: Dict[str, Agent] = {}
@@ -232,11 +265,16 @@ def train(
         agent_objs[ag] = Agent(
             ag, owned, trace_refs, lambda_dim, device, alpha, alpha_rho, lambda_e, 
             gamma=1.0, grad_clip=grad_clip, optimizers=optimizers,
-            eta=eta, constraint_thresholds=constraint_thresholds  # NEW
+            eta=eta, constraint_thresholds=constraint_thresholds,
+            constraint_is_local=constraint_is_local
         )
-    # ---------- pre-allocated joint-obs buffer ----------
-    joint_feat_dim = obs_dim + lambda_dim
-    agent_feat_buf = torch.empty(len(agents_list), joint_feat_dim, device=device)
+         # Add running average tracking for constraints
+        agent_objs[ag].recent_constraints = deque(maxlen=10)
+
+   # ---------- pre-allocated buffers for efficiency ----------
+    max_region_size = max(len(players) for players in region_graph.values())
+    agent_feat_buf = torch.zeros(max_region_size, obs_dim + lambda_dim, device=device)
+    
     # ---------- planner ----------
     planner = MaxSumPlanner(region_graph, A_i, n_iters=maxsum_iters, device=device)
     # ---------- unique checkpoint dir  ----------
@@ -244,7 +282,9 @@ def train(
     os.makedirs(ckpt_dir, exist_ok=True)
 
     # ---------- bookkeeping ----------
-    episode_returns, episode_lengths = [], []
+    # Limit history to prevent unbounded growth
+    episode_returns = deque(maxlen=1000)
+    episode_lengths = deque(maxlen=1000)
     td_errors: deque[float] = deque(maxlen=5_000)
 
     start_episode = 0
@@ -258,13 +298,31 @@ def train(
         # Restore optimizers
         for R, state_dict in checkpoint['optimizers'].items():
             optimizers[R].load_state_dict(state_dict)
+
+        # Restore schedulers
+        if 'schedulers' in checkpoint:
+            for R, state_dict in checkpoint['schedulers'].items():
+                schedulers[R].load_state_dict(state_dict)
+        
         
         # Restore agent states
         for ag, state in checkpoint['agent_states'].items():
             agent_objs[ag].lambda_vec = state['lambda_vec'].to(device)
             agent_objs[ag].prev_q = {
-                k: v.to(device) for k, v in state['prev_q'].items()
+                k: v.item() if torch.is_tensor(v) else v for k, v in state['prev_q'].items()
             }
+            # Restore constraint violations history
+            if 'constraint_violations' in state:
+                # Convert list back to deque
+                agent_objs[ag].constraint_violations = deque(
+                    state['constraint_violations'], 
+                    maxlen=100
+                )
+            else:
+                agent_objs[ag].constraint_violations = deque(maxlen=100)
+         
+
+        
         
         # Restore traces
         for R, traces in checkpoint['traces'].items():
@@ -276,6 +334,53 @@ def train(
 
     # ================== main loop ==================
     for ep in range(start_episode, num_episodes):
+        # Safety check at final episode
+        if ep == num_episodes - 1:
+            print(f"Final episode {ep+1} starting...")
+            print(f"Current learning rates:")
+            for R, opt in optimizers.items():
+                for param_group in opt.param_groups:
+                    print(f"  Region {R}: lr = {param_group['lr']}")
+            print(f"Current avg_rewards:")
+            for R, critic in region_critics.items():
+                print(f"  Region {R}: avg_reward = {critic.avg_reward.item()}")
+        # CONFIGURABLE MEMORY MANAGEMENT
+        if enable_aggressive_gc and ep % gc_frequency == 0 and ep > 0:
+            try:
+                import gc
+                gc.collect()
+                
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+            except Exception as e:
+                print(f"GC failed: {e}")
+            
+            # Check memory and warn
+            if memory_limit_mb is not None:
+                try:
+                    import psutil
+                    process = psutil.Process()
+                    memory_mb = process.memory_info().rss / 1024 / 1024
+                    
+                    if ep % 100 == 0:  # Log less frequently
+                        print(f"Episode {ep}: Memory = {memory_mb:.1f} MB")
+                    
+                    if memory_mb > memory_limit_mb:
+                        print(f"WARNING: Memory ({memory_mb:.1f} MB) exceeds limit ({memory_limit_mb} MB)")
+                        # Only reset traces as last resort
+                        print("Detaching traces to free memory...")
+                        for traces in trace_refs.values():
+                            for name, trace in traces.items():
+                                traces[name] = trace.detach()
+                except ImportError:
+                    pass  # psutil not available
+
+                        
+           
+        # Exploration decay - reduce exploration as training progresses 
+        current_epsilon = max(0.05, 0.3 * (1 - ep / num_episodes))  # Linear decay to 0.1
+        planner.epsilon = current_epsilon
+        
         obs_raw, _ = p_env.reset()
         obs_dict = to_tensors(obs_raw, device)
         planner.reset_messages()
@@ -284,32 +389,80 @@ def train(
         for traces in trace_refs.values():
             for e in traces.values():
                 e.zero_()
+
+        # Only reset traces if memory is critically high
+        if ep % 500 == 0 and ep > 0:
+            try:
+                import psutil
+                memory_mb = psutil.Process().memory_info().rss / 1024 / 1024
+                if memory_mb > 8000:  # Only if > 8GB
+                    print(f"Episode {ep}: Performing full trace reset...")
+                    for region, traces in trace_refs.items():
+                        for name in list(traces.keys()):
+                            del traces[name]
+                        # Recreate traces
+                        for name, p in region_critics[region].named_parameters():
+                            if p.requires_grad:
+                                traces[name] = torch.zeros_like(p, device=device).detach()
+                else:
+                   # Just detach without resetting
+                   for traces in trace_refs.values():
+                       for name, e in traces.items():
+                           traces[name] = e.detach()
+            except ImportError:
+               pass
+
         ep_return = 0.0
         ep_steps = 0
 
-        episode_constraint_rewards = {
-            ag: [0.0] * (num_constraints + 1) for ag in agents_list
+        # Track per-step satisfaction instead of cumulative
+        episode_stats = {
+            ag: {
+                'total_reward': 0.0,
+                'steps': 0,
+                'safety_satisfied': 0,  # Count of safe steps
+                'border_satisfied': 0,   # Count of border-defended steps
+            } for ag in agents_list
         }
 
         while p_env.agents:
+            # Debug observation structure (first episode, first few steps)
+            if ep == 0 and ep_steps < 3:
+                print(f"\n=== Episode {ep}, Step {ep_steps} ===")
+                for ag, obs in obs_dict.items():
+                    print(f"\n{ag} observation debug:")
+                    print(f"  Shape: {obs.shape}")
+                    if obs.numel() >= 11:
+                        # Reshape to see structure
+                        obs_reshaped = obs.view(-1, 11) if obs.numel() % 11 == 0 else obs.view(-1, 5)
+                        print(f"  First entity (current agent): {obs_reshaped[0].tolist()}")
+                        # Check for zombies
+                        for i in range(1, min(5, obs_reshaped.shape[0])):
+                            if obs_reshaped.shape[1] == 11:  # Has typemask
+                                if obs_reshaped[i, 0] > 0.5:  # Is zombie
+                                    print(f"  Zombie at row {i}: typemask={obs_reshaped[i, :6].tolist()}, dist={obs_reshaped[i, 6]:.3f}, rel_pos=({obs_reshaped[i, 7]:.3f}, {obs_reshaped[i, 8]:.3f})")
+            
             live = p_env.agents
 
             # ----- joint Q tables -----
-            q_tables: Dict[str, torch.Tensor] = {}
-            joint_obs_cache: Dict[str, torch.Tensor] = {}
-            for R, players in region_graph.items():
-                if not all(ag in live for ag in players):
-                    continue
-                # -------------------------------------------------
-                # Fast in-place build of the joint feature tensor
-                # -------------------------------------------------
-                for pos, ag in enumerate(players):
-                    agent_feat_buf[pos, :obs_dim].copy_(obs_dict[ag])
-                    agent_feat_buf[pos, obs_dim:].copy_(agent_objs[ag].lambda_vec)
-                joint_obs = agent_feat_buf[:len(players)].flatten()
-                joint_obs_cache[R] = joint_obs.clone().detach()
-                sizes_R = region_critics[R].sizes
-                q_tables[R] = region_critics[R](joint_obs).view(tuple(sizes_R))
+            with torch.no_grad():
+                q_tables: Dict[str, torch.Tensor] = {}
+                joint_obs_cache: Dict[str, torch.Tensor] = {}
+                for R, players in region_graph.items():
+                    if not all(ag in live for ag in players):
+                        continue
+                    # -------------------------------------------------
+                    # Fast in-place build of the joint feature tensor
+                    # -------------------------------------------------
+                    for pos, ag in enumerate(players):
+                        agent_feat_buf[pos, :obs_dim].copy_(obs_dict[ag])
+                        agent_feat_buf[pos, obs_dim:].copy_(agent_objs[ag].lambda_vec)
+                    joint_obs = agent_feat_buf[:len(players)].flatten()
+                    joint_obs_cache[R] = joint_obs.detach().clone()
+                    sizes_R = region_critics[R].sizes
+                    with torch.no_grad():
+                       q_tables[R] = region_critics[R](joint_obs).view(tuple(sizes_R)).detach()
+
 
             # ----- planner & env step -----
             planner.step(q_tables)
@@ -318,32 +471,67 @@ def train(
 
             # Environment step
             next_obs_raw, rewards, terms, truncs, _ = p_env.step(act_live)
-
-            # Decompose rewards
-            next_obs_raw, rewards, terms, truncs, _ = p_env.step(act_live)
             next_obs = to_tensors(next_obs_raw, device)
             reward_components = decomposer.decompose_rewards(next_obs, rewards)
 
-            # Accumulate constraint rewards
-            for ag, components in reward_components.items():
-                for i, r in enumerate(components):
-                    episode_constraint_rewards[ag][i] += r
+            # Track constraint satisfaction properly
+            for ag in live:
+                components = reward_components.get(ag, [0.0, 1.0, 1.0])
+                episode_stats[ag]['total_reward'] += components[0]  # Primary reward
+                episode_stats[ag]['steps'] += 1
+                episode_stats[ag]['safety_satisfied'] += (components[1] >= constraint_thresholds[0])
+                episode_stats[ag]['border_satisfied'] += (components[2] >= constraint_thresholds[1])
+
 
             # Update multipliers (if per-step)
             if multiplier_update_freq == "step":
-                for ag in live:
-                    agent_objs[ag].update_multipliers(reward_components[ag])
-                
-                # Gossip
-                for ag in live:
-                    neighbors = comm_graph.get_neighbors(ag)
-                    neighbor_lambdas = {
-                        n: agent_objs[n].lambda_vec 
-                        for n in neighbors if n in agent_objs
+                warmup_episodes = 100
+                if ep >= warmup_episodes:  
+                    # First update multipliers
+                    for ag in live:
+                        # Track recent constraint satisfaction
+                        if not hasattr(agent_objs[ag], 'recent_constraints'):
+                            agent_objs[ag].recent_constraints = deque(maxlen=10)
+                        
+                        agent_objs[ag].recent_constraints.append(reward_components[ag])
+                        
+                        # Use average of recent steps for more stable updates
+                        if len(agent_objs[ag].recent_constraints) > 0:
+                            avg_components = [
+                                np.mean([c[i] for c in agent_objs[ag].recent_constraints])
+                                for i in range(num_constraints + 1)
+                            ]
+                        else:
+                            avg_components = reward_components[ag]
+
+                        # Use decaying learning rate for multipliers
+                        agent_objs[ag].eta = current_eta
+                        agent_objs[ag].update_multipliers(avg_components)
+                    
+                    # Then gossip (asynchronous simulation)
+                    # Randomize gossip order to simulate asynchrony
+                    gossip_order = list(live)
+                    random.shuffle(gossip_order)
+                    
+                    # Create snapshot of current lambdas before gossip
+                    lambda_snapshot = {
+                        ag: agent_objs[ag].lambda_vec.clone() 
+                        for ag in live
                     }
-                    weights = comm_graph.get_weights(ag)
-                    agent_objs[ag].gossip_update(neighbor_lambdas, weights)
-            
+                    
+                    for ag in gossip_order:
+                        neighbors = comm_graph.get_neighbors(ag)
+                        neighbor_lambdas = {}
+                        for n in neighbors:
+                            if n in lambda_snapshot:
+                                neighbor_lambdas[n] = lambda_snapshot[n]
+                        weights = comm_graph.get_weights(ag)
+                        agent_objs[ag].gossip_update(neighbor_lambdas, weights)
+                else:
+                    # During warmup
+                    for ag in live:
+                        agent_objs[ag].lambda_vec.zero_()
+                
 
             # ----- bookkeeping -----
             ep_return += sum(rewards.values()) / max(len(rewards), 1)
@@ -356,12 +544,31 @@ def train(
                 if R not in joint_obs_cache:
                     continue  # Skip regions that weren't cached
 
-                # Dynamic owner: first alive agent in region
-                alive_players = [ag for ag in players if ag in rewards]
-                if not alive_players:
-                    continue  # No alive agents to perform update
+                # Original owner (first agent in region definition)
+                original_owner = players[0]
                 
-                owner = alive_players[0]  # Temporary owner for this update
+                # Check if original owner is still alive
+                if original_owner in rewards:
+                    owner = original_owner
+                else:
+                    # Find backup owner (maintain consistency)
+                    # Use deterministic selection based on agent ID to ensure consistency
+                    alive_players = [ag for ag in players if ag in rewards]
+                    if not alive_players:
+                        continue  # No alive agents to perform update
+                    
+                    # Sort alive players to ensure deterministic selection
+                    alive_players_sorted = sorted(alive_players)
+                    owner = alive_players_sorted[0]
+                    
+                    # Log owner change for debugging
+                    if ep % 100 == 0:  # Don't spam logs
+                        print(f"Region {R}: Owner changed from {original_owner} to {owner}")
+ 
+
+                # Ensure temporary owner has necessary structures
+                if owner not in agent_objs:
+                    continue  # Skip if owner doesn't exist
     
                 # Also check if all agents in this region took actions
                 if not all(ag in act_full for ag in players):
@@ -378,6 +585,16 @@ def train(
                 
                 # Get augmented reward using owner's multipliers
                 r_augmented = agent_objs[owner].get_augmented_reward(r_components)
+
+                # Debug: Check reward magnitudes
+                if ep % 100 == 0 and ep_steps == 1:  # Log once per 100 episodes
+                    print(f"Episode {ep}, Region {R}:")
+                    print(f"  Primary reward component: {r_components[0]:.4f}")
+                    print(f"  Safety component: {r_components[1]:.4f}")
+                    print(f"  Border component: {r_components[2]:.4f}")
+                    print(f"  Augmented reward: {r_augmented:.4f}")
+                    print(f"  Current avg_reward: {region_critics[R].avg_reward.item():.4f}")
+                 
     
                 
                 joint_act = tuple(act_full[ag] for ag in players)
@@ -395,66 +612,134 @@ def train(
                     r_augmented,  # Use augmented instead of raw reward
                     next_joint_obs
                 )
+
+                if not np.isfinite(delta):
+                    print(f"NaN/Inf detected at episode {ep}, step {ep_steps}")
+                    print(f"  Region: {R}")
+                    print(f"  Reward: {r_augmented}")
+                    print(f"  Avg reward: {region_critics[R].avg_reward.item()}")
+                    print(f"  Joint obs: {joint_obs_cache[R][:5]}...")  # First 5 values
+                    
+                    # Check critic weights
+                    for name, param in region_critics[R].named_parameters():
+                        if torch.isnan(param).any():
+                            print(f"  NaN in parameter: {name}")
+                    
+                    # Save emergency checkpoint
+                    emergency_path = os.path.join(ckpt_dir, f"nan_debug_ep{ep}.pt")
+                    save_full_checkpoint(...)
+                    print(f"Saved debug checkpoint to {emergency_path}")
+                    sys.exit(1)
                 
                 td_errors.append(float(delta))
+
+            # Clear caches to free memory
+            joint_obs_cache.clear()
+            q_tables.clear()
 
             obs_dict = next_obs
 
         # Update multipliers (if per-episode)
         if multiplier_update_freq == "episode":
-            for ag in agents_list:
-                agent_objs[ag].update_multipliers(episode_constraint_rewards[ag])
-
+            # Apply decay to multiplier learning rate
+            current_eta = max(current_eta * eta_decay, eta * 0.01)  # Floor at 1% of initial
             
-            # Gossip
+            normalized_rewards = {}
             for ag in agents_list:
-                neighbors = comm_graph.get_neighbors(ag)
-                neighbor_lambdas = {
-                    n: agent_objs[n].lambda_vec 
-                    for n in neighbors
-                }
-                weights = comm_graph.get_weights(ag)
-                agent_objs[ag].gossip_update(neighbor_lambdas, weights)
+                stats = episode_stats[ag]
+                steps = max(stats['steps'], 1)
+                # Average satisfaction rates
+                safety_rate = stats['safety_satisfied'] / steps
+                border_rate = stats['border_satisfied'] / steps
+                normalized_rewards[ag] = [
+                    stats['total_reward'] / steps,  # Average primary reward
+                    safety_rate,
+                    border_rate
+                ]
+            
+            warmup_episodes = 100
+            if ep >= warmup_episodes:  # Only update after warmup
+                for ag in agents_list:
+                    agent_objs[ag].update_multipliers(normalized_rewards[ag])
+                
+                # Gossip
+                for ag in agents_list:
+                    neighbors = comm_graph.get_neighbors(ag)
+                    neighbor_lambdas = {
+                        n: agent_objs[n].lambda_vec 
+                        for n in neighbors
+                    }
+                    weights = comm_graph.get_weights(ag)
+                    agent_objs[ag].gossip_update(neighbor_lambdas, weights)
+            else:
+                # During warmup, keep multipliers at zero
+                for ag in agents_list:
+                    agent_objs[ag].lambda_vec.zero_()
         
         # Log constraint metrics
-        constraints_satisfied = all(
-            episode_constraint_rewards[ag][j+1] >= constraint_thresholds[j]
+        # Calculate average constraint satisfaction across all agents
+        avg_safety_rate = np.mean([
+            episode_stats[ag]['safety_satisfied'] / max(episode_stats[ag]['steps'], 1)
             for ag in agents_list
-            for j in range(num_constraints)
+        ])
+        avg_border_rate = np.mean([
+            episode_stats[ag]['border_satisfied'] / max(episode_stats[ag]['steps'], 1)
+            for ag in agents_list
+        ])
+        
+        constraints_satisfied = (
+            avg_safety_rate >= constraint_thresholds[0] and
+            avg_border_rate >= constraint_thresholds[1]
         )
 
-        # ----- end of episode -----
         episode_returns.append(ep_return)
         episode_lengths.append(ep_steps)
 
+        # Step learning rate schedulers (unless final episode)
+        if ep < num_episodes - 1:
+            for scheduler in schedulers.values():
+                scheduler.step()
+        
+        # Additional decay for stability
+        if ep > 2000 and ep % 500 == 0:
+            for opt in optimizers.values():
+                for param_group in opt.param_groups:
+                    param_group['lr'] *= 0.9
+            print(f"Reduced learning rate at episode {ep}")
+
+
         if (ep + 1) % checkpoint_interval == 0:
+            # Save individual critic files (for backward compatibility)
             for name_R, critic in region_critics.items():
                 fname = f"{quote(name_R, safe='')}_critic.pt"
                 torch.save(critic.state_dict(), os.path.join(ckpt_dir, fname))
-
-            # keep only the latest *keep_last_ckpts* checkpoint sets
-            ckpts = sorted(
-                glob.glob(os.path.join(ckpt_dir, "*_critic.pt")),
-                key=os.path.getmtime,
+            
+            # SAVE FULL CHECKPOINT
+            full_ckpt_path = os.path.join(ckpt_dir, f"full_checkpoint_ep{ep+1}.pt")
+            save_full_checkpoint(
+                full_ckpt_path, ep + 1, region_critics, optimizers, 
+                schedulers, agent_objs, trace_refs, planner
             )
-            num_to_keep = len(region_critics) * keep_last_ckpts
-            if len(ckpts) > num_to_keep:
-                for old in ckpts[:-num_to_keep]:
+            
+            # Keep only the latest keep_last_ckpts full checkpoints
+            full_ckpts = sorted(
+                glob.glob(os.path.join(ckpt_dir, "full_checkpoint_*.pt")),
+                key=os.path.getmtime
+            )
+            if len(full_ckpts) > keep_last_ckpts:
+                for old in full_ckpts[:-keep_last_ckpts]:
                     os.remove(old)
+                    print(f"Removed old checkpoint: {old}")
 
         log_fn({"episode/return": ep_return, "episode/length": ep_steps}, step=ep + 1)
         
         if (ep + 1) % 50 == 0:
             metrics = {
-                "stats/mean_return_100": float(np.mean(episode_returns[-100:])),
-                "stats/mean_length_100": float(np.mean(episode_lengths[-100:])),
+                "stats/mean_return_100": float(np.mean(list(episode_returns)[-100:])),
+                "stats/mean_length_100": float(np.mean(list(episode_lengths)[-100:])),
                 "constraints/satisfied": float(constraints_satisfied),
-                "constraints/avg_safety_violations": np.mean([
-                    episode_constraint_rewards[ag][1] for ag in agents_list
-                ]),
-                "constraints/avg_border_violations": np.mean([
-                    episode_constraint_rewards[ag][2] for ag in agents_list
-                ]),
+                "constraints/avg_safety_rate": avg_safety_rate,
+                "constraints/avg_border_rate": avg_border_rate,
             }
             
             # Add TD error statistics
@@ -475,22 +760,27 @@ def train(
             metrics["lambda/mean_norm"] = float(np.mean(lambda_norms))
 
             # Log multiplier evolution
-            for i, ag in enumerate(agents_list[:min(2, len(agents_list))]):
+            for ag in agents_list:  # Remove the [:2] limitation
                 lambda_vals = agent_objs[ag].lambda_vec
-                for j in range(min(num_constraints, len(lambda_vals))):
-                    metrics[f"lambda/agent{i}_constraint{j}"] = lambda_vals[j].item()
+                for j in range(num_constraints):
+                    constraint_type = "local" if constraint_is_local[j] else "global"
+                    metrics[f"lambda/{ag}_constraint{j}_{constraint_type}"] = lambda_vals[j].item()
             
             # Log constraint violation rates
-            total_steps = ep_steps * len(agents_list)
-            if total_steps > 0:
-                metrics["constraints/safety_violation_rate"] = abs(
-                    sum(episode_constraint_rewards[ag][1] for ag in agents_list) / total_steps
-                )
-                metrics["constraints/border_violation_rate"] = abs(
-                    sum(episode_constraint_rewards[ag][2] for ag in agents_list) / total_steps
-                )
+            # Calculate violation rates (1 - satisfaction rate)
+            metrics["constraints/safety_violation_rate"] = 1.0 - avg_safety_rate
+            metrics["constraints/border_violation_rate"] = 1.0 - avg_border_rate
             
             log_fn(metrics, step=ep + 1)
+
+            # Force wandb to sync and clear buffer
+            if logger == "wandb":
+               try:
+                   import wandb
+                   if wandb.run is not None:
+                       wandb.log({}, commit=True)  # Force commit
+               except:
+                   pass
 
     close_logger()
 
@@ -503,6 +793,7 @@ def safe_train_step(agent, region, critic, joint_obs, joint_action, reward, next
         return delta
     except Exception as e:
         print(f"Warning: TD update failed for region {region}: {e}")
+        print(f"Traceback: {traceback.format_exc()}")
         # Log error but continue training
         return 0.0  # Return zero TD error
 
@@ -516,7 +807,7 @@ def evaluate_policy(
     region_graph: Dict[str, Iterable[str]] | None = None,
     episodes: int = 5,
     *,
-    lambda_dim: int = 1,
+    lambda_dim: int = 2,
     ckpt_dir: str = "checkpoints",
     render: bool = False,
     device: str | torch.device = "cpu",) -> None:
@@ -525,15 +816,27 @@ def evaluate_policy(
     if region_graph is None:
         region_graph = {"global": list(p_env.possible_agents)}
 
-    obs_dim = int(np.prod(p_env.observation_space(p_env.possible_agents[0]).shape))
+    # Get observation dimension from actual observation (same as training)
+    reset_out = p_env.reset()
+    if isinstance(reset_out, tuple):
+        obs_raw, _ = reset_out
+    else:
+        obs_raw = reset_out
+    
+    obs_dict = to_tensors(obs_raw, device)
+    obs_dim = next(iter(obs_dict.values())).numel()
+    
+    # Verify observation dimensions match across agents
+    assert all(o.numel() == obs_dim for o in obs_dict.values()), \
+        "Heterogeneous observation sizes detected"
+    
+    # Create critics with proper variable scoping
+    critics = {}
+    for R, agents in region_graph.items():
+        action_sizes = [p_env.action_space(a).n for a in agents]
+        critics[R] = RegionCritic(obs_dim, lambda_dim, action_sizes).to(device)
+    
 
-    critics = {
-        R: RegionCritic(
-                obs_dim, lambda_dim,
-                [p_env.action_space(a).n for a in agents]
-            ).to(device)
-        for R, agents in region_graph.items()
-    }
     action_sizes_eval = {a: p_env.action_space(a).n for a in p_env.possible_agents}
     planner = MaxSumPlanner(region_graph, action_sizes_eval, n_iters=3, epsilon=0.0, device=device)
 
@@ -541,13 +844,40 @@ def evaluate_policy(
         fname = f"{quote(R, safe='')}_critic.pt"
         path  = os.path.join(ckpt_dir, fname)
         if not os.path.exists(path):
-            raise FileNotFoundError(f"Expected critic checkpoint at {path}. "
-                                    "Run training or adjust --ckpt_dir.")
-        c.load_state_dict(torch.load(path, map_location=device))
+            # Try loading from full checkpoint instead
+            # Find the latest full checkpoint
+            full_ckpts = sorted(glob.glob(os.path.join(ckpt_dir, "full_checkpoint_*.pt")))
+            if full_ckpts:
+                full_ckpt_path = full_ckpts[-1]  # Use the latest
+            else:
+                raise FileNotFoundError(f"No checkpoints found in {ckpt_dir}")
+            
+            if os.path.exists(full_ckpt_path):
+                checkpoint = torch.load(full_ckpt_path, map_location=device)
+                c.load_state_dict(checkpoint['region_critics'][R])
+                print(f"Loaded critic for region {R} from full checkpoint")
+            else:
+                raise FileNotFoundError(f"No checkpoint found for region {R}")
+        else:
+            c.load_state_dict(torch.load(path, map_location=device))
+            print(f"Loaded critic for region {R} from {path}")
+
+    # Debug: Print dimensions to verify
+    print(f"Evaluation setup:")
+    print(f"  Observation dimension: {obs_dim}")
+    print(f"  Lambda dimension: {lambda_dim}")
+    print(f"  Region graph: {list(region_graph.keys())}")
+    for R, agents in region_graph.items():
+        print(f"  Region {R}: {len(agents)} agents, input_dim={(len(agents) * (obs_dim + lambda_dim))}")
+
 
     returns = []
     for _ in range(episodes):
-        obs_raw, _ = p_env.reset()
+        reset_out = p_env.reset()
+        if isinstance(reset_out, tuple):
+            obs_raw, _ = reset_out
+        else:
+            obs_raw = reset_out
         obs = to_tensors(obs_raw, device)
         # pre-allocated buffer to avoid per-step concat
         agent_feat_buf = torch.empty(len(p_env.possible_agents), obs_dim + lambda_dim, device=device)
@@ -565,9 +895,12 @@ def evaluate_policy(
                 q_tables[R] = critics[R](feats).view(tuple(critics[R].sizes))
             planner.step(q_tables)
             act = planner.select_actions()
+            # Only act for agents that are still alive
+            act = {ag: act[ag] for ag in p_env.agents if ag in act}
             next_obs_raw, rews, terms, truncs, _ = p_env.step(act)
             obs = to_tensors(next_obs_raw, device)
             ep_ret += sum(rews.values()) / max(len(rews), 1)
+
             if render:
                 p_env.render()
         returns.append(ep_ret)
@@ -592,6 +925,12 @@ def evaluate_policy(
 if __name__ == "__main__":
     from pettingzoo.butterfly import knights_archers_zombies_v10 as kaz
 
+    if torch.cuda.is_available():
+        torch.backends.cudnn.benchmark = True  
+        torch.backends.cuda.matmul.allow_tf32 = True  
+        print(f"✅ CUDA optimizations enabled for {torch.cuda.get_device_name()}")
+
+
     RUN_ID = time.strftime("%Y%m%d-%H%M%S")
     CKPT_DIR = os.path.join("checkpoints", "three_layer_pd_marl", RUN_ID)
 
@@ -602,18 +941,14 @@ if __name__ == "__main__":
         use_typemasks=True,  # Important for identifying zombies
     )
 
-    if torch.cuda.is_available():
-        torch.backends.cudnn.benchmark = True  
-        torch.backends.cuda.matmul.allow_tf32 = True  
-        print(f"✅ CUDA optimizations enabled for {torch.cuda.get_device_name()}")
-
-
     train(
         env,
-        num_episodes=10_000,
+        num_episodes=500,
         # Constraint parameters
-        constraint_thresholds=[0, 0],  # Per-episode limits
-        eta=2e-4,
+        # For safety: "agents must maintain safety 90% of the time"
+        # For border: "zombies must be kept from border 90% of the time"  
+        constraint_thresholds=[0.7, 0.7],  # Per-episode limits
+        eta=1e-4,
         alpha=2e-3,
         multiplier_update_freq="step",
         communication_topology="fully_connected",
@@ -634,7 +969,7 @@ if __name__ == "__main__":
     evaluate_policy(
         env,
         episodes=3,
-        lambda_dim=1,
+        lambda_dim=2,
         ckpt_dir=CKPT_DIR,
     )
 
