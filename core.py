@@ -108,13 +108,11 @@ class RegionCritic(nn.Module):
             if isinstance(m, nn.Linear):
                 nn.init.xavier_uniform_(m.weight, gain=0.01)
                 if m.bias is not None:
-                    nn.init.constant_(m.bias, -1.0)  # Pessimistic initialization
+                    nn.init.constant_(m.bias, 0.0)  # Pessimistic initialization
        
         # Baseline must persist in checkpoints **but** stay out of
         # Initialize with small value and add bounds
         self.register_buffer("avg_reward", torch.zeros(1))
-        self.register_buffer("avg_reward_min", torch.tensor(-1.0))
-        self.register_buffer("avg_reward_max", torch.tensor(1.0))
 
 
     def forward(self, obs_concat: torch.Tensor) -> torch.Tensor:
@@ -146,18 +144,9 @@ class MaxSumPlanner:
         # an entry in `action_sizes`, otherwise message buffers cannot be
         # initialised later on.
         # ------------------------------------------------------------------
-        unknown = {a for agents in region_graph.values() for a in agents} - self.sizes.keys()
-        if unknown:
-            raise ValueError(
-                f"No action size specified for agents: {sorted(unknown)}"
-            )
         self.n_iters = n_iters
         self.epsilon = epsilon
         self.device = torch.device(device)
-
-        # Adaptive clamping parameters
-        self.clamp_threshold = 50.0  # Start conservative
-        self.clamp_adaptation_rate = 0.01
 
         # message buffers   R→i  and  i→R
         self.msg_R_to_i: Dict[Tuple[str, str], torch.Tensor] = {}
@@ -203,15 +192,9 @@ class MaxSumPlanner:
                     if R not in q_tables:
                         continue
                     joint_q = q_tables[R]  # shape [A_i]*k (mixed‑radix)
+                    rank = joint_q.dim()
 
                     # ------- factor  →  variable (R → i) messages -------
-                    # Sanity-check tensor rank once to catch mis-shaped Q-tables early
-                    rank = joint_q.dim()
-                    if rank != len(agents):
-                        raise ValueError(
-                            f"q_tables[{R}].dim() = {rank}, expected {len(agents)} "
-                            f"(one axis per agent in region)"
-                        )
 
                     for axis, i in enumerate(agents):
                             inc = [self._broadcast(self.msg_i_to_R[(j, R)], ax_j, rank)
@@ -227,26 +210,7 @@ class MaxSumPlanner:
 
                             red_dims = tuple(d for d in range(rank) if d != axis)
                             new_msg = torch.amax(augmented, dim=red_dims)
-
-                            # --- Improved gauge-fix with numerical stability
-                            msg_max = new_msg.max()
-                            msg_min = new_msg.min()
-                            msg_range = msg_max - msg_min
-                            
-                            # Adapt clamping threshold based on observed ranges
-                            if msg_range > self.clamp_threshold * 2:
-                                # Range is too large, increase threshold slowly
-                                self.clamp_threshold = min(
-                                    self.clamp_threshold * (1 + self.clamp_adaptation_rate),
-                                    200.0  # Max threshold
-                                )
-                                new_msg = torch.clamp(
-                                    new_msg - msg_max, 
-                                    min=-self.clamp_threshold, 
-                                    max=self.clamp_threshold
-                                )
-                            else:
-                                new_msg -= msg_max
+                            new_msg -= new_msg.max()  # Simple gauge fix
 
                             self.msg_R_to_i[(R, i)] = new_msg.detach()
 
@@ -340,38 +304,21 @@ class Agent:
         sizes = critic.sizes
         idx = flat_index(joint_action, sizes)
         q_vec = critic(joint_obs)
-        if idx >= q_vec.numel():
-            raise IndexError(f"flat_index {idx} out of range for vector of length {q_vec.numel()}")
         q_val = q_vec[idx]  # This is still a tensor with gradients
 
         with torch.no_grad():
             q_val_float = q_val.item()  # Get float value for delta computation
             next_q = critic(next_joint_obs).max()
-            # Check for NaN
-            if torch.isnan(next_q):
-                print(f"WARNING: NaN detected in Q-values for region {region}")
-                # Try to recover by using mean instead of max
-                next_q_vec = critic(next_joint_obs)
-                valid_q = next_q_vec[~torch.isnan(next_q_vec)]
-                if len(valid_q) > 0:
-                    next_q = valid_q.mean()
-                else:
-                    next_q = torch.tensor(0.0, device=self.device)
-                    print(f"ERROR: All Q-values are NaN for region {region}")
             next_q_float = next_q.item()  # Convert to float
          
         # Compute delta as a float value
         delta = reward - critic.avg_reward.item() + next_q_float - q_val_float
 
-        # Prevent NaN/Inf propagation
-        if not np.isfinite(delta):
-            print(f"WARNING: Non-finite TD error {delta} in region {region}")
-            delta = 0.0
         # ------------------------------------------------------------------
         # Bound delta to a reasonable range before it is multiplied into traces.
         # Prevents inf/NaN in gradients when rewards spike.
         # ------------------------------------------------------------------
-        delta = float(max(min(delta, 10.0), -10.0))
+        delta = float(np.clip(delta, -10.0, 10.0))
 
         # ------------------ true-online differential TD(λ) ------------------
         critic.zero_grad()
@@ -407,23 +354,14 @@ class Agent:
 
         # Dual clipping for stability
         torch.nn.utils.clip_grad_norm_(critic.parameters(), self.grad_clip)
-        torch.nn.utils.clip_grad_value_(critic.parameters(), clip_value=1.0) 
         
-
         # optimiser step
         opt.step()
         opt.zero_grad(set_to_none=True)
 
         # running average reward baseline
         with torch.no_grad():
-            if not np.isfinite(self.alpha_rho * delta):
-                print(f"WARNING: Non-finite average reward update in region {region}")
-            else:
-                # Use exponential moving average with decay
-                decay = 0.999  # Stronger smoothing
-                new_avg = decay * critic.avg_reward + (1 - decay) * reward
-                # Clamp to reasonable game-specific bounds
-                critic.avg_reward.copy_(torch.clamp(new_avg, -0.1, 0.1))
+            critic.avg_reward.mul_(0.999).add_(0.001 * reward)
 
 
 

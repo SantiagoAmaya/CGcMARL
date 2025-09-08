@@ -32,7 +32,6 @@ class KAZRewardDecomposer:
         """
         self.danger_distance = danger_distance
         self.border_danger_rel_y = border_danger_rel_y
-        self._observation_format_cache = {}
 
     
     def decompose_rewards(self, 
@@ -61,54 +60,22 @@ class KAZRewardDecomposer:
         
         return decomposed
     
-    def decompose_rewards_batch(self, 
-                              observations: Dict[str, torch.Tensor],
-                              rewards: Dict[str, float],
-                              info: Dict = None) -> torch.Tensor:
-        """Batch version for efficiency - returns tensor [num_agents, num_objectives]"""
-        agents = list(observations.keys())
-        batch_rewards = torch.zeros(len(agents), 3)  # 3 objectives
-        for i, agent_id in enumerate(agents):
-            batch_rewards[i] = torch.tensor(self.decompose_rewards({agent_id: observations[agent_id]}, 
-                                                                  {agent_id: rewards.get(agent_id, 0.0)})[agent_id])
-        return batch_rewards
     
     def _detect_observation_format(self, obs: torch.Tensor) -> Tuple[int, bool, int]:
         """
-        Robustly detect observation format.
         Returns: (features_per_entity, has_typemask, num_entities)
         """
         total_features = obs.numel() if obs.dim() == 1 else obs.shape[1]
 
-        # Validate observation is not empty
-        if total_features == 0:
-            raise ValueError("Empty observation received")
-        
-        # Check cache
-        if total_features in self._observation_format_cache:
-            return self._observation_format_cache[total_features]
-        
-        # Try standard formats first
+        # Simple format detection
         if total_features % 11 == 0:
-            result = (11, True, total_features // 11)
+            return (11, True, total_features // 11)
         elif total_features % 5 == 0:
-            result = (5, False, total_features // 5)
+            return (5, False, total_features // 5)
         else:
-            # Fallback: try to infer
-            print(f"Warning: Non-standard observation size {total_features}")
-            # Assume typemask format if large enough
-            if total_features >= 33:  # At least 3 entities with typemask
-                features_per_entity = 11
-            else:
-                features_per_entity = 5
-            num_entities = total_features // features_per_entity
-            result = (features_per_entity, features_per_entity == 11, num_entities)
-        
-        self._observation_format_cache[total_features] = result
-        return result   
+            raise ValueError(f"Non-standard observation size {total_features}")
     
     def _compute_constraint_rewards(self, obs: torch.Tensor, agent_id: str) -> Tuple[float, float]:
-        """Compute constraint-based rewards using relative observations only."""
         
         if obs.dim() == 1:
             features_per_entity, has_typemask, num_entities = self._detect_observation_format(obs)
@@ -122,7 +89,6 @@ class KAZRewardDecomposer:
         
         # Track zombie information
         min_zombie_distance = float('inf')
-        max_zombie_rel_y = -float('inf')  # Track furthest zombie below agent
         total_zombies = 0
         zombies_in_danger_zone = 0
         
@@ -140,7 +106,6 @@ class KAZRewardDecomposer:
                 # After typemask (6 values), the structure is:
                 # [distance, rel_x, rel_y, heading_x, heading_y]
                 distance = obs[i, 6].item()
-                zombie_rel_x = obs[i, 7].item()
                 zombie_rel_y = obs[i, 8].item()
                 
                 # Sanity check on distance
@@ -150,66 +115,17 @@ class KAZRewardDecomposer:
                 total_zombies += 1
                 min_zombie_distance = min(min_zombie_distance, distance)
                 
-                max_zombie_rel_y = max(max_zombie_rel_y, zombie_rel_y)
-                
                 # Count zombies that are dangerously below the agent
                 if zombie_rel_y > self.border_danger_rel_y:
                     zombies_in_danger_zone += 1
         
         # r¹: Safety constraint (binary with small smooth zone)
-        if min_zombie_distance == float('inf'):
-            r1 = 1.0
-        elif min_zombie_distance < self.danger_distance:
-            r1 = 0.0
-        elif min_zombie_distance < self.danger_distance * 2:
-            # Smooth transition
-            r1 = (min_zombie_distance - self.danger_distance) / self.danger_distance
-        else:
-            r1 = 1.0
-        
+        r1 = 1.0 if min_zombie_distance > self.danger_distance else 0.0
         # r²: Border defense (based on relative positions)
-        if total_zombies > 0:
-            # Use combination of metrics for robustness
-            danger_fraction = zombies_in_danger_zone / total_zombies
-            
-            # Also consider the furthest zombie below us
-            if max_zombie_rel_y > 0.3:  # Very far below
-                danger_fraction = min(1.0, danger_fraction + 0.3)
-            
-            r2 = max(0.0, 1.0 - danger_fraction)
-        else:
-            r2 = 1.0
+        r2 = 1.0 - (zombies_in_danger_zone / total_zombies) if total_zombies > 0 else 1.0
         
         return r1, r2
     
-    def validate_observation(self, obs: torch.Tensor, agent_id: str) -> bool:
-        """Validate observation structure and log issues."""
-        if obs.dim() == 1:
-            features_per_entity, has_typemask, num_entities = self._detect_observation_format(obs)
-            obs = obs.view(num_entities, features_per_entity)
-        
-        # Check first row (should be current agent)
-        first_row = obs[0]
-        if has_typemask:
-            current_agent_mask = first_row[5]  # Should be 1.0 for current agent
-            if abs(current_agent_mask - 1.0) > 0.1:
-                print(f"Warning: First row doesn't appear to be current agent for {agent_id}")
-                return False
-        
-        # Count entities
-        entity_count = 0
-        zombie_count = 0
-        for i in range(1, obs.shape[0]):
-            if torch.abs(obs[i]).sum() > 1e-6:  # Non-zero row
-                entity_count += 1
-                if has_typemask and obs[i, 0] > 0.5:  # Is zombie
-                    zombie_count += 1
-        
-        # Log for debugging (remove in production)
-        if entity_count > 0 and zombie_count == 0:
-            print(f"Agent {agent_id}: {entity_count} entities but no zombies detected")
-        
-        return True
     
 """
 3. COMMUNICATION TOPOLOGY

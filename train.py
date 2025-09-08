@@ -131,10 +131,6 @@ def train(
     multiplier_update_freq: str = "step",
     communication_topology: str = "fully_connected",
     *,
-    min_agent_zombie_dist: float = 0.15,  # Configurable safety distance
-    min_zombie_border_dist: float = 0.2,   # Configurable border distance
-    safety_penalty: float = -0.1,          # Penalty magnitude
-    border_penalty: float = -0.2,          # Penalty magnitude
     maxsum_iters: int = 3,
     resume_from: str = None,
     alpha: float = 1e-3,
@@ -149,7 +145,6 @@ def train(
     checkpoint_interval: int = 500,
     keep_last_ckpts: int = 5,
     run_id: str | None = None,
-    memory_limit_mb: float = None,  # Add configurable memory limit
     enable_aggressive_gc: bool = False,  # Make GC optional
     gc_frequency: int = 100,  # Configurable GC frequency
  ):
@@ -334,52 +329,7 @@ def train(
 
     # ================== main loop ==================
     for ep in range(start_episode, num_episodes):
-        # Safety check at final episode
-        if ep == num_episodes - 1:
-            print(f"Final episode {ep+1} starting...")
-            print(f"Current learning rates:")
-            for R, opt in optimizers.items():
-                for param_group in opt.param_groups:
-                    print(f"  Region {R}: lr = {param_group['lr']}")
-            print(f"Current avg_rewards:")
-            for R, critic in region_critics.items():
-                print(f"  Region {R}: avg_reward = {critic.avg_reward.item()}")
-        # CONFIGURABLE MEMORY MANAGEMENT
-        if enable_aggressive_gc and ep % gc_frequency == 0 and ep > 0:
-            try:
-                import gc
-                gc.collect()
-                
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-            except Exception as e:
-                print(f"GC failed: {e}")
-            
-            # Check memory and warn
-            if memory_limit_mb is not None:
-                try:
-                    import psutil
-                    process = psutil.Process()
-                    memory_mb = process.memory_info().rss / 1024 / 1024
-                    
-                    if ep % 100 == 0:  # Log less frequently
-                        print(f"Episode {ep}: Memory = {memory_mb:.1f} MB")
-                    
-                    if memory_mb > memory_limit_mb:
-                        print(f"WARNING: Memory ({memory_mb:.1f} MB) exceeds limit ({memory_limit_mb} MB)")
-                        # Only reset traces as last resort
-                        print("Detaching traces to free memory...")
-                        for traces in trace_refs.values():
-                            for name, trace in traces.items():
-                                traces[name] = trace.detach()
-                except ImportError:
-                    pass  # psutil not available
-
-                        
-           
-        # Exploration decay - reduce exploration as training progresses 
-        current_epsilon = max(0.05, 0.3 * (1 - ep / num_episodes))  # Linear decay to 0.1
-        planner.epsilon = current_epsilon
+        planner.epsilon = max(0.05, 0.3 * (1 - ep / num_episodes))
         
         obs_raw, _ = p_env.reset()
         obs_dict = to_tensors(obs_raw, device)
@@ -389,28 +339,6 @@ def train(
         for traces in trace_refs.values():
             for e in traces.values():
                 e.zero_()
-
-        # Only reset traces if memory is critically high
-        if ep % 500 == 0 and ep > 0:
-            try:
-                import psutil
-                memory_mb = psutil.Process().memory_info().rss / 1024 / 1024
-                if memory_mb > 8000:  # Only if > 8GB
-                    print(f"Episode {ep}: Performing full trace reset...")
-                    for region, traces in trace_refs.items():
-                        for name in list(traces.keys()):
-                            del traces[name]
-                        # Recreate traces
-                        for name, p in region_critics[region].named_parameters():
-                            if p.requires_grad:
-                                traces[name] = torch.zeros_like(p, device=device).detach()
-                else:
-                   # Just detach without resetting
-                   for traces in trace_refs.values():
-                       for name, e in traces.items():
-                           traces[name] = e.detach()
-            except ImportError:
-               pass
 
         ep_return = 0.0
         ep_steps = 0
@@ -426,22 +354,6 @@ def train(
         }
 
         while p_env.agents:
-            # Debug observation structure (first episode, first few steps)
-            if ep == 0 and ep_steps < 3:
-                print(f"\n=== Episode {ep}, Step {ep_steps} ===")
-                for ag, obs in obs_dict.items():
-                    print(f"\n{ag} observation debug:")
-                    print(f"  Shape: {obs.shape}")
-                    if obs.numel() >= 11:
-                        # Reshape to see structure
-                        obs_reshaped = obs.view(-1, 11) if obs.numel() % 11 == 0 else obs.view(-1, 5)
-                        print(f"  First entity (current agent): {obs_reshaped[0].tolist()}")
-                        # Check for zombies
-                        for i in range(1, min(5, obs_reshaped.shape[0])):
-                            if obs_reshaped.shape[1] == 11:  # Has typemask
-                                if obs_reshaped[i, 0] > 0.5:  # Is zombie
-                                    print(f"  Zombie at row {i}: typemask={obs_reshaped[i, :6].tolist()}, dist={obs_reshaped[i, 6]:.3f}, rel_pos=({obs_reshaped[i, 7]:.3f}, {obs_reshaped[i, 8]:.3f})")
-            
             live = p_env.agents
 
             # ----- joint Q tables -----
@@ -485,46 +397,17 @@ def train(
 
             # Update multipliers (if per-step)
             if multiplier_update_freq == "step":
-                warmup_episodes = 100
-                if ep >= warmup_episodes:  
+                if ep >= 100:  # Warmup
                     # First update multipliers
                     for ag in live:
-                        # Track recent constraint satisfaction
-                        if not hasattr(agent_objs[ag], 'recent_constraints'):
-                            agent_objs[ag].recent_constraints = deque(maxlen=10)
-                        
-                        agent_objs[ag].recent_constraints.append(reward_components[ag])
-                        
-                        # Use average of recent steps for more stable updates
-                        if len(agent_objs[ag].recent_constraints) > 0:
-                            avg_components = [
-                                np.mean([c[i] for c in agent_objs[ag].recent_constraints])
-                                for i in range(num_constraints + 1)
-                            ]
-                        else:
-                            avg_components = reward_components[ag]
-
                         # Use decaying learning rate for multipliers
                         agent_objs[ag].eta = current_eta
-                        agent_objs[ag].update_multipliers(avg_components)
+                        agent_objs[ag].update_multipliers(reward_components[ag])
                     
                     # Then gossip (asynchronous simulation)
-                    # Randomize gossip order to simulate asynchrony
-                    gossip_order = list(live)
-                    random.shuffle(gossip_order)
-                    
-                    # Create snapshot of current lambdas before gossip
-                    lambda_snapshot = {
-                        ag: agent_objs[ag].lambda_vec.clone() 
-                        for ag in live
-                    }
-                    
-                    for ag in gossip_order:
+                    for ag in live:
                         neighbors = comm_graph.get_neighbors(ag)
-                        neighbor_lambdas = {}
-                        for n in neighbors:
-                            if n in lambda_snapshot:
-                                neighbor_lambdas[n] = lambda_snapshot[n]
+                        neighbor_lambdas = {n: agent_objs[n].lambda_vec for n in neighbors if n in live}
                         weights = comm_graph.get_weights(ag)
                         agent_objs[ag].gossip_update(neighbor_lambdas, weights)
                 else:
@@ -544,31 +427,9 @@ def train(
                 if R not in joint_obs_cache:
                     continue  # Skip regions that weren't cached
 
-                # Original owner (first agent in region definition)
-                original_owner = players[0]
-                
-                # Check if original owner is still alive
-                if original_owner in rewards:
-                    owner = original_owner
-                else:
-                    # Find backup owner (maintain consistency)
-                    # Use deterministic selection based on agent ID to ensure consistency
-                    alive_players = [ag for ag in players if ag in rewards]
-                    if not alive_players:
-                        continue  # No alive agents to perform update
-                    
-                    # Sort alive players to ensure deterministic selection
-                    alive_players_sorted = sorted(alive_players)
-                    owner = alive_players_sorted[0]
-                    
-                    # Log owner change for debugging
-                    if ep % 100 == 0:  # Don't spam logs
-                        print(f"Region {R}: Owner changed from {original_owner} to {owner}")
- 
-
-                # Ensure temporary owner has necessary structures
-                if owner not in agent_objs:
-                    continue  # Skip if owner doesn't exist
+                owner = players[0] if players[0] in rewards else None
+                if not owner:
+                   continue
     
                 # Also check if all agents in this region took actions
                 if not all(ag in act_full for ag in players):
@@ -585,18 +446,7 @@ def train(
                 
                 # Get augmented reward using owner's multipliers
                 r_augmented = agent_objs[owner].get_augmented_reward(r_components)
-
-                # Debug: Check reward magnitudes
-                if ep % 100 == 0 and ep_steps == 1:  # Log once per 100 episodes
-                    print(f"Episode {ep}, Region {R}:")
-                    print(f"  Primary reward component: {r_components[0]:.4f}")
-                    print(f"  Safety component: {r_components[1]:.4f}")
-                    print(f"  Border component: {r_components[2]:.4f}")
-                    print(f"  Augmented reward: {r_augmented:.4f}")
-                    print(f"  Current avg_reward: {region_critics[R].avg_reward.item():.4f}")
-                 
-    
-                
+                    
                 joint_act = tuple(act_full[ag] for ag in players)
                 
                 # Build next joint observation
@@ -605,37 +455,8 @@ def train(
                     agent_feat_buf[pos, obs_dim:].copy_(agent_objs[ag].lambda_vec)
                 next_joint_obs = agent_feat_buf[:len(players)].flatten()
                 
-                # Safe TD update with error handling
-                delta = safe_train_step(
-                    agent_objs[owner],
-                    R, region_critics[R], joint_obs_cache[R], joint_act, 
-                    r_augmented,  # Use augmented instead of raw reward
-                    next_joint_obs
-                )
-
-                if not np.isfinite(delta):
-                    print(f"NaN/Inf detected at episode {ep}, step {ep_steps}")
-                    print(f"  Region: {R}")
-                    print(f"  Reward: {r_augmented}")
-                    print(f"  Avg reward: {region_critics[R].avg_reward.item()}")
-                    print(f"  Joint obs: {joint_obs_cache[R][:5]}...")  # First 5 values
-                    
-                    # Check critic weights
-                    for name, param in region_critics[R].named_parameters():
-                        if torch.isnan(param).any():
-                            print(f"  NaN in parameter: {name}")
-                    
-                    # Save emergency checkpoint
-                    emergency_path = os.path.join(ckpt_dir, f"nan_debug_ep{ep}.pt")
-                    save_full_checkpoint(...)
-                    print(f"Saved debug checkpoint to {emergency_path}")
-                    sys.exit(1)
-                
+                delta = agent_objs[owner].td_update_region(R, region_critics[R], joint_obs_cache[R], joint_act, r_augmented, next_joint_obs)
                 td_errors.append(float(delta))
-
-            # Clear caches to free memory
-            joint_obs_cache.clear()
-            q_tables.clear()
 
             obs_dict = next_obs
 
@@ -783,19 +604,6 @@ def train(
                    pass
 
     close_logger()
-
-def safe_train_step(agent, region, critic, joint_obs, joint_action, reward, next_joint_obs):
-    """Wrapper with error handling for TD updates"""
-    try:
-        delta = agent.td_update_region(
-            region, critic, joint_obs, joint_action, reward, next_joint_obs
-        )
-        return delta
-    except Exception as e:
-        print(f"Warning: TD update failed for region {region}: {e}")
-        print(f"Traceback: {traceback.format_exc()}")
-        # Log error but continue training
-        return 0.0  # Return zero TD error
 
 ###############################################################################
 # Evaluation (completed)                                                      #
