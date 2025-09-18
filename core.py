@@ -101,18 +101,17 @@ class RegionCritic(nn.Module):
         self.sizes = [int(s) for s in action_sizes]
         input_dim = len(self.sizes) * (obs_dim_per_agent + lambda_dim)
         output_dim = int(np.prod(self.sizes))
-        self.q_net = MLP(input_dim, output_dim)
+        self.q_net = MLP(input_dim, output_dim, hidden=(64, 64))
                
         # Better initialization for stability
         for m in self.q_net.modules():
             if isinstance(m, nn.Linear):
-                nn.init.xavier_uniform_(m.weight, gain=0.01)
+                nn.init.orthogonal_(m.weight, gain=0.01)
                 if m.bias is not None:
-                    nn.init.constant_(m.bias, 0.0)  # Pessimistic initialization
+                    nn.init.constant_(m.bias, 0.0)  
        
-        # Baseline must persist in checkpoints **but** stay out of
         # Initialize with small value and add bounds
-        self.register_buffer("avg_reward", torch.zeros(1))
+        self.register_buffer("avg_reward", torch.tensor([0.5], dtype=torch.float32))
 
 
     def forward(self, obs_concat: torch.Tensor) -> torch.Tensor:
@@ -132,7 +131,7 @@ class MaxSumPlanner:
     def __init__(
         self,
         region_graph: Dict[str, List[str]],
-        action_sizes: Dict[str, int],            #  new
+        action_sizes: Dict[str, int],            
         n_iters: int = 3,
         epsilon: float = 0.05,
         device: torch.device | str = "cpu",
@@ -167,9 +166,18 @@ class MaxSumPlanner:
                 self.msg_i_to_R[(i, R)] = self._zeros(i)
 
     def reset_messages(self):
+
         with torch.no_grad():
+           
+           # Store old messages for warm start (optional)
+           old_msgs = {}
+           
            for key in self.msg_R_to_i:
-               self.msg_R_to_i[key].zero_()
+                old_msgs[key] = self.msg_R_to_i[key].clone()
+           
+           for key in self.msg_R_to_i:
+               # Warm start: decay old messages instead of full reset
+               self.msg_R_to_i[key] = old_msgs[key] * 0.1  # Keep 10% of old info
                self.msg_R_to_i[key] = self.msg_R_to_i[key].detach()
            for key in self.msg_i_to_R:
                self.msg_i_to_R[key].zero_()
@@ -212,7 +220,10 @@ class MaxSumPlanner:
                             new_msg = torch.amax(augmented, dim=red_dims)
                             new_msg -= new_msg.max()  # Simple gauge fix
 
-                            self.msg_R_to_i[(R, i)] = new_msg.detach()
+                            # Add damping for stability (0.5 is typical)
+                            damping = 0.5
+                            old_msg = self.msg_R_to_i[(R, i)]
+                            self.msg_R_to_i[(R, i)] = (damping * old_msg + (1 - damping) * new_msg).detach()
 
                 # variable → factor
                 for i in {a for agents in self.region_graph.values() for a in agents}:
@@ -253,9 +264,9 @@ class MaxSumPlanner:
         self.device = new_dev
         return self
 
-###############################################################################
-# Agent (owns traces and multipliers)                                         #
-###############################################################################
+#######################################
+# Agent (owns traces and multipliers)  #
+#######################################
 
 class Agent:
     def __init__(
@@ -269,7 +280,6 @@ class Agent:
         self.id = agent_id
         self.owned_regions = owned_regions  # list of region names where this agent is **owner** (first in list)
         self.traces_refs = traces_refs      # region→param_name→trace tensor
-        self.lambda_vec = torch.zeros(lambda_dim, device=device)
         self.device = device
         self.alpha = alpha
         self.alpha_rho = alpha_rho
@@ -286,13 +296,15 @@ class Agent:
         self.constraint_is_local = constraint_is_local or [False] * self.num_constraints
         
         # Initialize multipliers
-        self.lambda_vec = torch.zeros(lambda_dim, device=device)
+        self.lambda_vec = torch.zeros(lambda_dim, device=device, requires_grad=False)
         if lambda_dim != self.num_constraints:
             raise ValueError(f"lambda_dim ({lambda_dim}) must match num_constraints ({self.num_constraints})")
 
         
-        # Track violations for monitoring
-        self.constraint_violations = deque(maxlen=100)
+        # Track violations for CVaR-based updates
+        self.safety_history = deque(maxlen=100)  # Track safety penalties
+        self.border_history = deque(maxlen=100)  # Track border penalties
+        self.warmup_steps = 20  # Need some history before using CVaR
 
         # Initialize traces properly for owned regions
         for region in self.owned_regions:
@@ -303,27 +315,47 @@ class Agent:
     def td_update_region(self, region: str, critic: RegionCritic, joint_obs: torch.Tensor, joint_action: Tuple[int, ...], reward: float, next_joint_obs: torch.Tensor):
         sizes = critic.sizes
         idx = flat_index(joint_action, sizes)
+        # Ensure inputs are finite
+        if not (torch.isfinite(joint_obs).all() and torch.isfinite(next_joint_obs).all()):
+            print(f"[WARNING] Non-finite observations detected, skipping update")
+            return 0.0
         q_vec = critic(joint_obs)
+        # Clamp Q-values to prevent explosion
+        q_vec = torch.clamp(q_vec, min=-100, max=100)
+               
+        # Check for Q-value explosion
+        if not torch.isfinite(q_vec).all() or q_vec.abs().max() > 1e6:
+            print(f"[WARNING] Q-values exploding: {q_vec.abs().max():.2e}, resetting critic")
+            # Reset the critic weights
+            for m in critic.q_net.modules():
+                if isinstance(m, nn.Linear):
+                    nn.init.orthogonal_(m.weight, gain=0.5)
+                    if m.bias is not None:
+                        nn.init.constant_(m.bias, 0.0)
+            return 0.0
         q_val = q_vec[idx]  # This is still a tensor with gradients
 
         with torch.no_grad():
-            q_val_float = q_val.item()  # Get float value for delta computation
             next_q = critic(next_joint_obs).max()
-            next_q_float = next_q.item()  # Convert to float
+            # Clamp next Q to prevent explosion
+            next_q = torch.clamp(next_q, min=-100, max=100)
+            # Clip next Q to prevent explosion
+            next_q = torch.clamp(next_q, min=-100, max=100)
+            # Compute TD target
+            td_target = reward - critic.avg_reward.item() + self.gamma * next_q.item()
+            # Clip TD target to prevent explosion
+            td_target = np.clip(td_target, -5.0, 5.0)
          
-        # Compute delta as a float value
-        delta = reward - critic.avg_reward.item() + next_q_float - q_val_float
+        # Compute delta using the actual Q-value
+        delta = td_target - q_val.item()
 
-        # ------------------------------------------------------------------
-        # Bound delta to a reasonable range before it is multiplied into traces.
-        # Prevents inf/NaN in gradients when rewards spike.
-        # ------------------------------------------------------------------
-        delta = float(np.clip(delta, -10.0, 10.0))
+        # Clipping for stability
+        delta = float(np.clip(delta, -2.0, 2.0))
+
+       
 
         # ------------------ true-online differential TD(λ) ------------------
         critic.zero_grad()
-        # need q_val as a tensor for backward pass
-        q_val = q_vec[idx]  # Re-get it as tensor for gradient computation
         q_val.backward(retain_graph=False, create_graph=False)
 
         traces = self.traces_refs[region]
@@ -334,6 +366,9 @@ class Agent:
                 continue
 
             grad = p.grad.detach()
+            # Clip gradients before applying to traces
+            grad = torch.clamp(grad, min=-1.0, max=1.0)
+
             if name not in traces:
                 traces[name] = torch.zeros_like(p, device=self.device)
             e = traces[name]
@@ -341,9 +376,10 @@ class Agent:
             # Online eligibility trace update
             with torch.no_grad():  # Ensure no graph creation
                dot = torch.dot(e.flatten(), grad.flatten()).item()
-               e.mul_(self.gamma * self.lambda_e).add_(
-                   grad * (1.0 - self.alpha * self.gamma * self.lambda_e * dot)
-               )
+               # Decay traces more aggressively to prevent accumulation
+               e.mul_(self.gamma * self.lambda_e * 0.9).add_(grad)
+               # Clip traces to prevent explosion
+               e = torch.clamp(e, min=-10.0, max=10.0)
                # Detach and reassign
                e = e.detach_()
                traces[name] = e
@@ -353,7 +389,7 @@ class Agent:
                p.grad = (e * delta).detach_()
 
         # Dual clipping for stability
-        torch.nn.utils.clip_grad_norm_(critic.parameters(), self.grad_clip)
+        torch.nn.utils.clip_grad_norm_(critic.parameters(), 1) # actual run with 0.5
         
         # optimiser step
         opt.step()
@@ -361,19 +397,21 @@ class Agent:
 
         # running average reward baseline
         with torch.no_grad():
-            critic.avg_reward.mul_(0.999).add_(0.001 * reward)
+            # Slower adaptation to prevent oscillation
+            critic.avg_reward.mul_(0.995).add_(0.005 * reward)
+            # Bound average reward
+            critic.avg_reward.clamp_(min=0.0, max=5.0)
 
 
 
         # store last Q for next step (needed by full TO formulation)
         with torch.no_grad():
-           self.prev_q[region] = next_q_float  # Store as float, not tensor
-
+           self.prev_q[region] = next_q.item()  # Store as float, not tensor
 
         return float(delta)
     
     def update_multipliers(self, reward_components: List[float]) -> None:
-        """Update multipliers based on constraint violations"""
+        """Update multipliers using CVaR for distance-based constraints"""
         # Safety check for reward components
         expected_components = self.num_constraints + 1
         if len(reward_components) < expected_components:
@@ -381,14 +419,44 @@ class Agent:
             # Pad with zeros if needed
             reward_components = reward_components + [0.0] * (expected_components - len(reward_components))
         
-        for j in range(self.num_constraints):
-            # Violation is positive when constraint is violated (r_j < c_j)
-            violation = self.constraint_thresholds[j] - reward_components[j + 1]
-            self.lambda_vec[j] = torch.clamp(
-                 self.lambda_vec[j] + self.eta * violation,
-                 min=0.0,
-                 max=20.0
-             )
+        # Track history
+        if self.num_constraints >= 1:
+            self.safety_history.append(reward_components[1])  # r1: local distance constraint
+        if self.num_constraints >= 2:
+            self.border_history.append(reward_components[2])  # r2: global defense line
+        
+        # Use CVaR after warmup period
+        if len(self.safety_history) >= self.warmup_steps:
+            # Local constraint (index 0)
+            if self.num_constraints >= 1:
+                # For distance constraints (positive = good), lower percentile = worst outcomes
+                safety_cvar = np.percentile(list(self.safety_history), 10)
+                # Violation when CVaR < threshold (0.0)
+                violation = self.constraint_thresholds[0] - safety_cvar
+                self.lambda_vec[0] = torch.clamp(
+                    self.lambda_vec[0] + self.eta * violation,
+                    min=0.0,
+                    max=10.0  
+                )
+            
+            # Global constraint (index 1)
+            if self.num_constraints >= 2:
+                border_cvar = np.percentile(list(self.border_history), 10)
+                violation = self.constraint_thresholds[1] - border_cvar
+                self.lambda_vec[1] = torch.clamp(
+                    self.lambda_vec[1] + self.eta * violation,
+                    min=0.0,
+                    max=10.0
+                )
+        else:
+            # During warmup, use simple average
+            for j in range(self.num_constraints):
+                violation = self.constraint_thresholds[j] - reward_components[j + 1]
+                self.lambda_vec[j] = torch.clamp(
+                    self.lambda_vec[j] + self.eta * violation,
+                    min=0.0,
+                    max=10.0
+                )
     
     def gossip_update(self, neighbor_lambdas: Dict[str, torch.Tensor], weights: Dict[str, float]):
         """Gossip consensus update following Eq. 15 from the paper"""
@@ -412,7 +480,12 @@ class Agent:
     
     def get_augmented_reward(self, reward_components: List[float]) -> float:
         """Compute augmented reward for TD updates"""
+        # If all multipliers are zero (unconstrained), just return primary reward
+        if self.lambda_vec.norm().item() < 1e-8:
+            return reward_components[0]
+        
         r_augmented = reward_components[0]  # Primary
         for j in range(self.num_constraints):
             r_augmented += self.lambda_vec[j].item() * reward_components[j + 1]
         return r_augmented
+    

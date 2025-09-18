@@ -3,3 +3,5 @@ wandb/
 
 # Ignore model checkpoints
 checkpoints/
+
+lazul.py

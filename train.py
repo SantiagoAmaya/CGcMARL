@@ -61,6 +61,7 @@ import traceback
 import numpy as np
 import torch
 from torch.optim import SGD
+import torch.nn as nn
 
 # ──────────────────────────────────────────────────────────────
 # Project modules
@@ -68,7 +69,7 @@ from torch.optim import SGD
 from utils import to_tensors                    # tensor helpers
 from core import Agent, RegionCritic, MaxSumPlanner
 from logger import setup_logger                 # (log_fn, close_fn)
-from kaz_constraints import KAZRewardDecomposer, CommunicationGraph  # Your new modules
+from kaz_constraints import KAZRewardDecomposer, CommunicationGraph, FactorGraph  
 
 
 def save_full_checkpoint(
@@ -103,7 +104,9 @@ def save_full_checkpoint(
                     k: torch.tensor(v) if not torch.is_tensor(v) else v.cpu() 
                     for k, v in agent.prev_q.items()
                 },
-                'constraint_violations': list(agent.constraint_violations),  # Convert deque to list
+                'safety_history': list(agent.safety_history),  # Convert deque to list
+                'border_history': list(agent.border_history),  # Convert deque to list
+                
                 'eta': agent.eta  # Save current learning rate
             }
             for ag, agent in agent_objs.items()
@@ -128,14 +131,14 @@ def train(
     constraint_thresholds: list[float] = None,
     eta: float = None, 
     eta_decay: float = 0.999,
-    multiplier_update_freq: str = "step",
+    multiplier_update_freq: str = "never",
     communication_topology: str = "fully_connected",
     *,
     maxsum_iters: int = 3,
     resume_from: str = None,
     alpha: float = 1e-3,
     alpha_rho_ratio: float = 0.1,
-    lambda_e: float = 0.95,
+    lambda_e: float = 0,
     region_graph: Dict[str, Iterable[str]] | None = None,
     device: str | torch.device = "cpu",
     logger: str = "wandb",              # "wandb", "tensorboard", or "none"
@@ -174,11 +177,15 @@ def train(
             pass
 
     if constraint_thresholds is None:
-        constraint_thresholds = [0.5, 0.5]  # No constraints
+        # Distance-based thresholds (constraint satisfied when r > 0)
+        # Local: average distance constraint should be > 0
+        # Global: average distance to defense line should be > 0
+        constraint_thresholds = [0.0, 0.0]
+
 
     # Ensure two-timescale separation: η_t = o(α_t)
     if eta is None:
-        eta = alpha * 0.01  # Multiplier learning should be slower
+        eta = alpha * 0.001  # Multiplier learning should be slower
     # Track effective eta for decay
     current_eta = eta
   
@@ -216,10 +223,7 @@ def train(
 
     agents_list = list(obs_dict.keys())
     A_i = {ag: p_env.action_space(ag).n for ag in agents_list}
-    decomposer = KAZRewardDecomposer(
-        danger_distance=0.02,       # Only death is penalized
-        border_danger_rel_y=0.1   # Bottom 10% is critical
-    )
+    decomposer = KAZRewardDecomposer(use_dense_rewards=True)
     comm_graph = CommunicationGraph(agents_list, communication_topology)
 
     # Validate communication graph connectivity
@@ -246,10 +250,10 @@ def train(
         region_critics[R] = crit
         trace_refs[R] = {name: torch.zeros_like(p, device=device)
                         for name, p in crit.named_parameters() if p.requires_grad}
-        optimizers[R] = SGD(crit.parameters(), lr=alpha)
+        optimizers[R] = torch.optim.SGD(crit.parameters(), lr=alpha, momentum=0.9) # actual run with adam
 
     schedulers = {
-        R: torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=num_episodes+10, eta_min=alpha*0.01)
+        R: torch.optim.lr_scheduler.ExponentialLR(opt, gamma=0.9999)
         for R, opt in optimizers.items()
     }
     # ---------- agents ----------
@@ -306,19 +310,28 @@ def train(
             agent_objs[ag].prev_q = {
                 k: v.item() if torch.is_tensor(v) else v for k, v in state['prev_q'].items()
             }
-            # Restore constraint violations history
-            if 'constraint_violations' in state:
-                # Convert list back to deque
-                agent_objs[ag].constraint_violations = deque(
-                    state['constraint_violations'], 
+            # Restore CVaR histories
+            if 'safety_history' in state:
+                agent_objs[ag].safety_history = deque(
+                    state['safety_history'], 
                     maxlen=100
                 )
             else:
-                agent_objs[ag].constraint_violations = deque(maxlen=100)
+                agent_objs[ag].safety_history = deque(maxlen=100)
+            
+            if 'border_history' in state:
+                agent_objs[ag].border_history = deque(
+                    state['border_history'], 
+                    maxlen=100
+                )
+            else:
+                agent_objs[ag].border_history = deque(maxlen=100)
+            
+            # Restore eta if present
+            if 'eta' in state:
+                agent_objs[ag].eta = state['eta']
          
-
-        
-        
+     
         # Restore traces
         for R, traces in checkpoint['traces'].items():
             for name, trace in traces.items():
@@ -329,7 +342,11 @@ def train(
 
     # ================== main loop ==================
     for ep in range(start_episode, num_episodes):
-        planner.epsilon = max(0.05, 0.3 * (1 - ep / num_episodes))
+        # More exploration early on
+        if ep < 2000:
+            planner.epsilon = 0.5  # High exploration initially
+        else:
+            planner.epsilon = max(0.15, 0.5 * np.exp(-(ep - 1000) / 2000))
         
         obs_raw, _ = p_env.reset()
         obs_dict = to_tensors(obs_raw, device)
@@ -342,14 +359,19 @@ def train(
 
         ep_return = 0.0
         ep_steps = 0
+        ep_zombie_kills = 0  # Track actual kills
+        ep_sparse_return = 0.0  # Track original sparse rewards
+        ep_dense_bonus = 0.0    # Track dense reward contribution
 
         # Track per-step satisfaction instead of cumulative
         episode_stats = {
             ag: {
                 'total_reward': 0.0,
                 'steps': 0,
-                'safety_satisfied': 0,  # Count of safe steps
-                'border_satisfied': 0,   # Count of border-defended steps
+                'safety_penalty_sum': 0.0,
+                'border_penalty_sum': 0.0,
+                'avg_safety_penalty': 0.0,
+                'avg_border_penalty': 0.0,
             } for ag in agents_list
         }
 
@@ -383,16 +405,37 @@ def train(
 
             # Environment step
             next_obs_raw, rewards, terms, truncs, _ = p_env.step(act_live)
+            # Track sparse rewards before decomposition
+            ep_sparse_return += sum(rewards.values()) / max(len(rewards), 1)
+
             next_obs = to_tensors(next_obs_raw, device)
             reward_components = decomposer.decompose_rewards(next_obs, rewards)
+
+            # Calculate dense bonus
+            step_dense_bonus = 0.0
+            for ag in live:
+                original_reward = rewards.get(ag, 0.0)
+                augmented_reward = reward_components[ag][0]
+                dense_contribution = augmented_reward - original_reward
+                step_dense_bonus += dense_contribution
+                ep_dense_bonus += dense_contribution / max(len(rewards), 1)
+            
+
+            # Count actual zombie kills (non-zero rewards)
+            step_kills = sum(1 for r in rewards.values() if r > 0)
+            ep_zombie_kills += step_kills
 
             # Track constraint satisfaction properly
             for ag in live:
                 components = reward_components.get(ag, [0.0, 1.0, 1.0])
                 episode_stats[ag]['total_reward'] += components[0]  # Primary reward
                 episode_stats[ag]['steps'] += 1
-                episode_stats[ag]['safety_satisfied'] += (components[1] >= constraint_thresholds[0])
-                episode_stats[ag]['border_satisfied'] += (components[2] >= constraint_thresholds[1])
+                episode_stats[ag]['safety_penalty_sum'] += components[1]
+                episode_stats[ag]['border_penalty_sum'] += components[2]
+                # Update running averages
+                steps = episode_stats[ag]['steps']
+                episode_stats[ag]['avg_safety_penalty'] = episode_stats[ag]['safety_penalty_sum'] / steps
+                episode_stats[ag]['avg_border_penalty'] = episode_stats[ag]['border_penalty_sum'] / steps
 
 
             # Update multipliers (if per-step)
@@ -414,6 +457,10 @@ def train(
                     # During warmup
                     for ag in live:
                         agent_objs[ag].lambda_vec.zero_()
+            elif multiplier_update_freq == "never":
+               # Keep multipliers at zero - pure reward optimization
+               for ag in live:
+                   agent_objs[ag].lambda_vec.zero_()
                 
 
             # ----- bookkeeping -----
@@ -458,6 +505,24 @@ def train(
                 delta = agent_objs[owner].td_update_region(R, region_critics[R], joint_obs_cache[R], joint_act, r_augmented, next_joint_obs)
                 td_errors.append(float(delta))
 
+                # Check for divergence every 100 steps
+                if ep_steps % 100 == 0:
+                    with torch.no_grad():
+                        test_q = region_critics[R](joint_obs_cache[R])
+                        if test_q.abs().max() > 1000:
+                            print(f"[RESET] Q-values too large ({test_q.abs().max():.2e}), resetting critic for region {R}")
+                            # Reset the critic
+                            for m in region_critics[R].q_net.modules():
+                                if isinstance(m, nn.Linear):
+                                    nn.init.orthogonal_(m.weight, gain=0.5)
+                                    if m.bias is not None:
+                                        nn.init.constant_(m.bias, 0.0)
+                            # Reset traces
+                            for e in trace_refs[R].values():
+                                e.zero_()
+                            # Reset average reward
+                            region_critics[R].avg_reward.fill_(0.1)
+
             obs_dict = next_obs
 
         # Update multipliers (if per-episode)
@@ -496,21 +561,27 @@ def train(
                 # During warmup, keep multipliers at zero
                 for ag in agents_list:
                     agent_objs[ag].lambda_vec.zero_()
-        
+        elif multiplier_update_freq == "never":
+           # Keep multipliers at zero
+           for ag in agents_list:
+               agent_objs[ag].lambda_vec.zero_()
+
         # Log constraint metrics
         # Calculate average constraint satisfaction across all agents
-        avg_safety_rate = np.mean([
-            episode_stats[ag]['safety_satisfied'] / max(episode_stats[ag]['steps'], 1)
+        # track average constraint values
+        avg_local_constraint = np.mean([
+            episode_stats[ag].get('avg_safety_penalty', 0.0)  # distance metric
             for ag in agents_list
         ])
-        avg_border_rate = np.mean([
-            episode_stats[ag]['border_satisfied'] / max(episode_stats[ag]['steps'], 1)
+        avg_global_constraint = np.mean([
+            episode_stats[ag].get('avg_border_penalty', 0.0)  # defense line metric
             for ag in agents_list
         ])
         
+        # Constraints satisfied when distance metrics are above thresholds (positive)
         constraints_satisfied = (
-            avg_safety_rate >= constraint_thresholds[0] and
-            avg_border_rate >= constraint_thresholds[1]
+            avg_local_constraint >= constraint_thresholds[0] and
+            avg_global_constraint >= constraint_thresholds[1]
         )
 
         episode_returns.append(ep_return)
@@ -521,12 +592,13 @@ def train(
             for scheduler in schedulers.values():
                 scheduler.step()
         
-        # Additional decay for stability
-        if ep > 2000 and ep % 500 == 0:
-            for opt in optimizers.values():
-                for param_group in opt.param_groups:
-                    param_group['lr'] *= 0.9
-            print(f"Reduced learning rate at episode {ep}")
+        if ep > 2000 and ep % 1000 == 0:
+            recent_mean = np.mean(list(episode_returns)[-100:])
+            if recent_mean > 1.5:  # Only reduce if doing well
+                for opt in optimizers.values():
+                    for param_group in opt.param_groups:
+                        param_group['lr'] *= 0.95
+                print(f"Reduced learning rate at episode {ep} (performance: {recent_mean:.2f})")
 
 
         if (ep + 1) % checkpoint_interval == 0:
@@ -552,15 +624,15 @@ def train(
                     os.remove(old)
                     print(f"Removed old checkpoint: {old}")
 
-        log_fn({"episode/return": ep_return, "episode/length": ep_steps}, step=ep + 1)
+        log_fn({"episode/return": ep_return, "episode/length": ep_steps, "episode/zombie_kills": ep_zombie_kills,}, step=ep + 1)
         
-        if (ep + 1) % 50 == 0:
+        if (ep + 1) % 200 == 0:
             metrics = {
                 "stats/mean_return_100": float(np.mean(list(episode_returns)[-100:])),
                 "stats/mean_length_100": float(np.mean(list(episode_lengths)[-100:])),
                 "constraints/satisfied": float(constraints_satisfied),
-                "constraints/avg_safety_rate": avg_safety_rate,
-                "constraints/avg_border_rate": avg_border_rate,
+                "constraints/avg_local_distance": avg_local_constraint,
+                "constraints/avg_global_defense": avg_global_constraint,
             }
             
             # Add TD error statistics
@@ -575,6 +647,18 @@ def train(
             # Add per-region average rewards
             for R, critic in region_critics.items():
                 metrics[f"avg_reward/{R}"] = float(critic.avg_reward.item())
+
+            # Add Q-value statistics to see if they're changing
+            for R, critic in region_critics.items():
+                with torch.no_grad():
+                    # Create a dummy observation to check Q-values
+                    dummy_obs = torch.randn(
+                        len(region_graph[R]) * (obs_dim + lambda_dim), 
+                        device=device
+                    )
+                    q_vals = critic(dummy_obs)
+                    print(f"[Q-VALUES] Ep {ep}, Region {R}: mean={q_vals.mean():.3f}, "
+                            f"std={q_vals.std():.3f}, max={q_vals.max():.3f}, min={q_vals.min():.3f}")
             
             # Add lambda vector statistics
             lambda_norms = [agent.lambda_vec.norm().item() for agent in agent_objs.values()]
@@ -588,9 +672,9 @@ def train(
                     metrics[f"lambda/{ag}_constraint{j}_{constraint_type}"] = lambda_vals[j].item()
             
             # Log constraint violation rates
-            # Calculate violation rates (1 - satisfaction rate)
-            metrics["constraints/safety_violation_rate"] = 1.0 - avg_safety_rate
-            metrics["constraints/border_violation_rate"] = 1.0 - avg_border_rate
+            # For distance metrics, negative = violation
+            metrics["constraints/local_violation"] = float(avg_local_constraint < constraint_thresholds[0])
+            metrics["constraints/global_violation"] = float(avg_global_constraint < constraint_thresholds[1])
             
             log_fn(metrics, step=ep + 1)
 
@@ -744,27 +828,28 @@ if __name__ == "__main__":
 
     # Knights–Archers–Zombies is parallel by default and uses a Discrete(9) action space.
     env = kaz.parallel_env(
-        render_mode=None,
+        render_mode="human",
         vector_state=True,
         use_typemasks=True,  # Important for identifying zombies
     )
 
+    agents_list = ["archer_0", "archer_1", "knight_0", "knight_1"]
+    factor_graph = FactorGraph(agents_list, topology="overlapping")
+
     train(
         env,
-        num_episodes=500,
-        # Constraint parameters
-        # For safety: "agents must maintain safety 90% of the time"
-        # For border: "zombies must be kept from border 90% of the time"  
-        constraint_thresholds=[0.7, 0.7],  # Per-episode limits
-        eta=1e-4,
-        alpha=2e-3,
-        multiplier_update_freq="step",
+        num_episodes=50000,
+        constraint_thresholds=[0.0, 0.0],  # [safety_penalty, border_penalty]
+        eta=1e-5,
+        alpha=1e-4,
+        multiplier_update_freq="never",  # "step", "episode", or "never"
         communication_topology="fully_connected",
+        region_graph=factor_graph.get_region_graph(),
         device="cuda" if torch.cuda.is_available() else "cpu",
         logger="wandb",
         project="three_layer_pd_marl",
         seed=0,
-        grad_clip=5.0,
+        grad_clip=10.0,
         run_id=RUN_ID,
     )
 
